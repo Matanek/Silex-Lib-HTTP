@@ -1,0 +1,119 @@
+use HTTP
+use HTTP.Client
+use STD.IO
+use STD.Network
+use STD.Network.TCP
+use STD.Process
+use STD.Text.UTF8
+
+func raw_ambiguous_request(port:uint16) {
+    let endpoint = Network.Endpoint(
+        address:Network.IpAddress.ipv4([127, 0, 0, 1]),
+        port:port,
+        scope_id:0
+    )
+    var stream:TCP.Stream? = null
+    match TCP.connect(endpoint, TCP.ConnectOptions(
+        connect_timeout_milliseconds:null,
+        stream:TCP.StreamOptions(read_timeout_milliseconds:2_000, write_timeout_milliseconds:2_000)
+    )) {
+        success(value) => { stream = value }
+        failure(error) => { panic(error.detail) }
+    }
+    let request = UTF8.bytes(
+        "POST /known HTTP/1.1\r\n" +
+        "Host: 127.0.0.1:$(port)\r\n" +
+        "Content-Length: 1\r\n" +
+        "Transfer-Encoding: chunked\r\n\r\n"
+    )
+    if var connection = stream {
+        match IO.write_all<TCP.Stream>(connection, @request[0:request.count()]) {
+            success => {}
+            failure(error) => { panic(error.detail) }
+        }
+        match connection.shutdown_write() {
+            success => {}
+            failure(error) => { panic(error.detail) }
+        }
+        var response:uint8[] = []
+        match IO.read_to_end<TCP.Stream>(connection, 65_536) {
+            success(value) => { response = value }
+            failure(error) => { panic(error.detail) }
+        }
+        assert(response.count() >= 12)
+        assert(response[9] == 52 && response[10] == 48 && response[11] == 48)
+        match TCP.close(move connection) { success => {}; failure(error) => {} }
+    } else { panic("raw HTTP connection should be available") }
+}
+
+func run(port:uint16) Result<void, HTTP.Error> {
+    let origin = "http://127.0.0.1:$(port)"
+
+    match Client.get(origin + "/known", Client.default_options().with_public_network_only()) {
+        success(response) => { panic("public-only policy should reject loopback") }
+        failure(error) => { assert(error.kind == HTTP.ErrorKind.network_policy) }
+    }
+    print("ok - loopback policy")
+
+    var slow = try Client.open(
+        origin + "/slow",
+        Client.default_options().with_total_timeout(20)
+    )
+    match slow.read_all() {
+        success(bytes) => { panic("slow response should exceed the total deadline") }
+        failure(error) => { assert(error.kind == HTTP.ErrorKind.deadline_exceeded) }
+    }
+    match slow.close() { success => {}; failure(error) => {} }
+    print("ok - slow response deadline")
+
+    var cutoff = try Client.open(origin + "/cutoff")
+    match cutoff.read_all() {
+        success(bytes) => { panic("premature response cutoff should fail") }
+        failure(error) => { assert(error.kind == HTTP.ErrorKind.closed) }
+    }
+    match cutoff.close() { success => {}; failure(error) => {} }
+    print("ok - premature cutoff")
+
+    var redirected = try Client.open(origin + "/redirect")
+    assert(redirected.status() == 200)
+    let redirected_body = try redirected.read_all()
+    assert(redirected_body.count() == 14)
+    try redirected.close()
+    print("ok - streaming redirect")
+
+    raw_ambiguous_request(port)
+    print("ok - ambiguous framing")
+
+    var healthy = try Client.get(origin + "/known")
+    assert(try healthy.text() == "known stream")
+    print("deadlines, cutoffs, ambiguity rejection and server recovery verified")
+    return Result<void, HTTP.Error>.success()
+}
+
+func selected_port() uint16 {
+    match Process.arguments() {
+        success(arguments) => {
+            if arguments.count() > 1 { return parse_port(arguments[1]) }
+        }
+        failure(error) => { panic(error.detail) }
+    }
+    return 18082
+}
+
+func parse_port(text:str) uint16 {
+    var value = 0
+    for byte in UTF8.bytes(text) {
+        if byte < 48 || byte > 57 { panic("network test port must be numeric") }
+        value = value * 10 + (byte - 48) as int
+        if value > 65_535 { panic("network test port exceeds uint16") }
+    }
+    if value <= 0 { panic("network test port must be positive") }
+    return value as uint16
+}
+
+func main() {
+    match run(selected_port()) {
+        success => {}
+        failure(error) => { panic(error.detail) }
+    }
+}

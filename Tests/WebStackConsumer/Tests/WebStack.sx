@@ -37,5 +37,14 @@ test "compose public web package APIs" {
         HTTP.QueryParameter(name:"language", value:"fr")
     ]) == "format=html&language=fr")
     assert(Client.default_options().maximum_redirects == 10)
+    let bounded = Client.default_options()
+        .with_total_timeout(5_000)
+        .with_public_network_only()
+    assert(bounded.address_policy == Client.AddressPolicy.public_only)
+    var headers = HTTP.Headers()
+    match headers.try_set("Accept", "application/json") {
+        success => { assert(headers.contains("Accept")) }
+        failure(error) => { panic(error.detail) }
+    }
     assert(TLS.available())
 }

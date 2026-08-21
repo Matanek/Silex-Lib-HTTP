@@ -1,0 +1,74 @@
+use HTTP
+use HTTP.Client
+use STD.Error
+use STD.IO
+use STD.Process
+use STD.Text.UTF8
+
+class TextWriter:IO.Writer {
+    private var bytes:uint8[]
+
+    init() { self.bytes = [] }
+
+    func write(buffer:@uint8[..]) Result<int, Error> {
+        for byte in buffer { self.bytes.append(byte) }
+        return Result<int, Error>.success(buffer.count())
+    }
+
+    func text() str {
+        if self.bytes.is_empty() { return "" }
+        match UTF8.decode(@self.bytes[0:self.bytes.count()]) {
+            success(value) => { return value }
+            failure(error) => { panic("streamed response is not UTF-8") }
+        }
+    }
+}
+
+func run(port:uint16) Result<void, HTTP.Error> {
+    let origin = "http://127.0.0.1:$(port)"
+
+    var progressive = try Client.open(origin + "/chunked")
+    let prefix = try progressive.read(4)
+    assert(prefix.count() == 4)
+    let remainder = try progressive.read_all()
+    assert(remainder.count() == 10)
+    try progressive.close()
+
+    var output = TextWriter()
+    var known = try Client.open(origin + "/known")
+    let copied = try known.copy_to<TextWriter>(output)
+    assert(copied == 12)
+    assert(output.text() == "known stream")
+    try known.close()
+
+    print("progressive and fixed-length response streaming verified")
+    return Result<void, HTTP.Error>.success()
+}
+
+func selected_port() uint16 {
+    match Process.arguments() {
+        success(arguments) => {
+            if arguments.count() > 1 { return parse_port(arguments[1]) }
+        }
+        failure(error) => { panic(error.detail) }
+    }
+    return 18082
+}
+
+func parse_port(text:str) uint16 {
+    var value = 0
+    for byte in UTF8.bytes(text) {
+        if byte < 48 || byte > 57 { panic("streaming client port must be numeric") }
+        value = value * 10 + (byte - 48) as int
+        if value > 65_535 { panic("streaming client port exceeds uint16") }
+    }
+    if value <= 0 { panic("streaming client port must be positive") }
+    return value as uint16
+}
+
+func main() {
+    match run(selected_port()) {
+        success => {}
+        failure(error) => { panic(error.detail) }
+    }
+}

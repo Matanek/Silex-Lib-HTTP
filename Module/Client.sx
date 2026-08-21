@@ -1,43 +1,146 @@
 use HTTP
 use HTTP.Codec
+use STD.Error as StandardError
 use STD.IO
+use STD.Network
 use STD.Network.TCP
 use STD.Network.TLS
 
+public enum AddressPolicy {
+    unrestricted
+    public_only
+}
+
 public struct Options {
     let limits:HTTP.Limits
+    let connect_timeout_milliseconds:int?
     let read_timeout_milliseconds:int?
     let write_timeout_milliseconds:int?
+    let total_timeout_milliseconds:int?
     let maximum_redirects:int
     let allow_insecure_redirects:bool
+    let address_policy:AddressPolicy
 
     func with_limits(value:HTTP.Limits) Options {
         return Options(
             limits:value,
+            connect_timeout_milliseconds:self.connect_timeout_milliseconds,
             read_timeout_milliseconds:self.read_timeout_milliseconds,
             write_timeout_milliseconds:self.write_timeout_milliseconds,
+            total_timeout_milliseconds:self.total_timeout_milliseconds,
             maximum_redirects:self.maximum_redirects,
-            allow_insecure_redirects:self.allow_insecure_redirects
+            allow_insecure_redirects:self.allow_insecure_redirects,
+            address_policy:self.address_policy
+        )
+    }
+
+    func with_connect_timeout(milliseconds:int?) Options {
+        return Options(
+            limits:self.limits,
+            connect_timeout_milliseconds:milliseconds,
+            read_timeout_milliseconds:self.read_timeout_milliseconds,
+            write_timeout_milliseconds:self.write_timeout_milliseconds,
+            total_timeout_milliseconds:self.total_timeout_milliseconds,
+            maximum_redirects:self.maximum_redirects,
+            allow_insecure_redirects:self.allow_insecure_redirects,
+            address_policy:self.address_policy
+        )
+    }
+
+    func with_read_timeout(milliseconds:int?) Options {
+        return Options(
+            limits:self.limits,
+            connect_timeout_milliseconds:self.connect_timeout_milliseconds,
+            read_timeout_milliseconds:milliseconds,
+            write_timeout_milliseconds:self.write_timeout_milliseconds,
+            total_timeout_milliseconds:self.total_timeout_milliseconds,
+            maximum_redirects:self.maximum_redirects,
+            allow_insecure_redirects:self.allow_insecure_redirects,
+            address_policy:self.address_policy
+        )
+    }
+
+    func with_write_timeout(milliseconds:int?) Options {
+        return Options(
+            limits:self.limits,
+            connect_timeout_milliseconds:self.connect_timeout_milliseconds,
+            read_timeout_milliseconds:self.read_timeout_milliseconds,
+            write_timeout_milliseconds:milliseconds,
+            total_timeout_milliseconds:self.total_timeout_milliseconds,
+            maximum_redirects:self.maximum_redirects,
+            allow_insecure_redirects:self.allow_insecure_redirects,
+            address_policy:self.address_policy
+        )
+    }
+
+    func with_total_timeout(milliseconds:int?) Options {
+        return Options(
+            limits:self.limits,
+            connect_timeout_milliseconds:self.connect_timeout_milliseconds,
+            read_timeout_milliseconds:self.read_timeout_milliseconds,
+            write_timeout_milliseconds:self.write_timeout_milliseconds,
+            total_timeout_milliseconds:milliseconds,
+            maximum_redirects:self.maximum_redirects,
+            allow_insecure_redirects:self.allow_insecure_redirects,
+            address_policy:self.address_policy
         )
     }
 
     func with_redirects(maximum:int) Options {
         return Options(
             limits:self.limits,
+            connect_timeout_milliseconds:self.connect_timeout_milliseconds,
             read_timeout_milliseconds:self.read_timeout_milliseconds,
             write_timeout_milliseconds:self.write_timeout_milliseconds,
+            total_timeout_milliseconds:self.total_timeout_milliseconds,
             maximum_redirects:maximum,
-            allow_insecure_redirects:self.allow_insecure_redirects
+            allow_insecure_redirects:self.allow_insecure_redirects,
+            address_policy:self.address_policy
         )
     }
 
     func with_insecure_redirects(allowed:bool = true) Options {
         return Options(
             limits:self.limits,
+            connect_timeout_milliseconds:self.connect_timeout_milliseconds,
             read_timeout_milliseconds:self.read_timeout_milliseconds,
             write_timeout_milliseconds:self.write_timeout_milliseconds,
+            total_timeout_milliseconds:self.total_timeout_milliseconds,
             maximum_redirects:self.maximum_redirects,
-            allow_insecure_redirects:allowed
+            allow_insecure_redirects:allowed,
+            address_policy:self.address_policy
+        )
+    }
+
+    func with_address_policy(policy:AddressPolicy) Options {
+        return Options(
+            limits:self.limits,
+            connect_timeout_milliseconds:self.connect_timeout_milliseconds,
+            read_timeout_milliseconds:self.read_timeout_milliseconds,
+            write_timeout_milliseconds:self.write_timeout_milliseconds,
+            total_timeout_milliseconds:self.total_timeout_milliseconds,
+            maximum_redirects:self.maximum_redirects,
+            allow_insecure_redirects:self.allow_insecure_redirects,
+            address_policy:policy
+        )
+    }
+
+    func with_public_network_only(required:bool = true) Options {
+        var policy = AddressPolicy.unrestricted
+        if required { policy = AddressPolicy.public_only }
+        return self.with_address_policy(policy)
+    }
+
+    func without_timeouts() Options {
+        return Options(
+            limits:self.limits,
+            connect_timeout_milliseconds:null,
+            read_timeout_milliseconds:null,
+            write_timeout_milliseconds:null,
+            total_timeout_milliseconds:null,
+            maximum_redirects:self.maximum_redirects,
+            allow_insecure_redirects:self.allow_insecure_redirects,
+            address_policy:self.address_policy
         )
     }
 }
@@ -45,15 +148,401 @@ public struct Options {
 public func default_options() Options {
     return Options(
         limits:HTTP.default_limits(),
+        connect_timeout_milliseconds:null,
         read_timeout_milliseconds:30_000,
         write_timeout_milliseconds:30_000,
+        total_timeout_milliseconds:120_000,
         maximum_redirects:10,
-        allow_insecure_redirects:false
+        allow_insecure_redirects:false,
+        address_policy:AddressPolicy.unrestricted
+    )
+}
+
+package class Connection:IO.Reader, IO.Writer {
+    private var tcp:TCP.Stream?
+    private var tls:TLS.Stream?
+
+    init(tcp:TCP.Stream?, tls:TLS.Stream?) {
+        self.tcp = tcp
+        self.tls = tls
+    }
+
+    static func plain(stream:TCP.Stream) Connection { return Connection(stream, null) }
+    static func secure(stream:TLS.Stream) Connection { return Connection(null, stream) }
+
+    func read(buffer:&uint8[..]) Result<int, StandardError> {
+        if var stream = self.tcp { return stream.read(buffer) }
+        if var stream = self.tls { return stream.read(buffer) }
+        return Result<int, StandardError>.failure(standard_error(
+            "http.read", "HTTP response connection is closed"
+        ))
+    }
+
+    func write(buffer:@uint8[..]) Result<int, StandardError> {
+        if var stream = self.tcp { return stream.write(buffer) }
+        if var stream = self.tls { return stream.write(buffer) }
+        return Result<int, StandardError>.failure(standard_error(
+            "http.write", "HTTP response connection is closed"
+        ))
+    }
+
+    func close() Result<void, HTTP.Error> {
+        if var stream = self.tcp {
+            self.tcp = null
+            match TCP.close(move stream) {
+                success => { return Result<void, HTTP.Error>.success() }
+                failure(error) => {
+                    return Result<void, HTTP.Error>.failure(HTTP.failure(
+                        HTTP.ErrorKind.network, error.subject, error.detail
+                    ))
+                }
+            }
+        }
+        if var stream = self.tls {
+            self.tls = null
+            match TLS.close(stream) {
+                success => { return Result<void, HTTP.Error>.success() }
+                failure(error) => {
+                    return Result<void, HTTP.Error>.failure(HTTP.failure(
+                        HTTP.ErrorKind.secure_transport, error.host, error.detail
+                    ))
+                }
+            }
+        }
+        return Result<void, HTTP.Error>.success()
+    }
+
+    drop { match self.close() { success => {}; failure(error) => {} } }
+}
+
+public class IncomingResponse {
+    private var metadata:HTTP.Response?
+    private var connection:Connection?
+    private let limits:HTTP.Limits
+    private let framing_kind:int
+    private var remaining:int
+    private var chunk_remaining:int
+    private var total:int
+    private var metadata_budget:int
+    private var complete:bool
+    private var deadline:HTTP.DeadlineBudget?
+
+    package init(
+        metadata:HTTP.Response,
+        connection:Connection,
+        limits:HTTP.Limits,
+        framing:Codec.BodyFraming,
+        expect_body:bool,
+        deadline:HTTP.DeadlineBudget
+    ) {
+        self.metadata = metadata
+        self.connection = connection
+        self.limits = limits
+        self.framing_kind = framing.kind
+        self.remaining = framing.length
+        self.chunk_remaining = 0
+        self.total = 0
+        self.metadata_budget = limits.maximum_header_bytes
+        self.complete = !expect_body || framing.kind == 1 && framing.length == 0
+        self.deadline = deadline
+    }
+
+    package static func start(
+        metadata:HTTP.Response,
+        connection:Connection,
+        limits:HTTP.Limits,
+        expect_body:bool,
+        deadline:HTTP.DeadlineBudget
+    ) Result<IncomingResponse, HTTP.Error> {
+        var framing = Codec.BodyFraming(kind:0, length:0)
+        match Codec.body_framing(metadata.headers()) {
+            success(value) => { framing = value }
+            failure(error) => { return Result<IncomingResponse, HTTP.Error>.failure(error) }
+        }
+        if framing.kind == 1 && framing.length > limits.maximum_body_bytes {
+            return Result<IncomingResponse, HTTP.Error>.failure(HTTP.failure(
+                HTTP.ErrorKind.body_limit, null, "HTTP body exceeds maximum_body_bytes"
+            ))
+        }
+        return Result<IncomingResponse, HTTP.Error>.success(IncomingResponse(
+            metadata, connection, limits, framing, expect_body, deadline
+        ))
+    }
+
+    func response() HTTP.Response { return self.metadata_value() }
+    func status() int { return self.metadata_value().status() }
+    func headers() HTTP.Headers { return self.metadata_value().headers() }
+    func finished() bool { return self.complete }
+
+    func read(maximum_bytes:int = 8_192) Result<uint8[], HTTP.Error> {
+        if maximum_bytes <= 0 {
+            return Result<uint8[], HTTP.Error>.failure(HTTP.failure(
+                HTTP.ErrorKind.body_stream, null, "incoming response read size must be positive"
+            ))
+        }
+        if self.complete { return Result<uint8[], HTTP.Error>.success([]) }
+        if var stream = self.connection {
+            if self.framing_kind == 1 {
+                var count = self.remaining
+                if count > maximum_bytes { count = maximum_bytes }
+                var bytes:uint8[] = []
+                match Codec.read_count<Connection>(stream, count, self.deadline_value()) {
+                    success(value) => { bytes = value }
+                    failure(error) => { return Result<uint8[], HTTP.Error>.failure(error) }
+                }
+                self.remaining -= bytes.count()
+                self.total += bytes.count()
+                if self.remaining == 0 { self.complete = true }
+                return Result<uint8[], HTTP.Error>.success(bytes)
+            }
+            if self.framing_kind == 2 { return self.read_chunk(stream, maximum_bytes) }
+            return self.read_close_delimited(stream, maximum_bytes)
+        }
+        return Result<uint8[], HTTP.Error>.failure(HTTP.failure(
+            HTTP.ErrorKind.closed, null, "incoming HTTP response is closed"
+        ))
+    }
+
+    func read_all() Result<uint8[], HTTP.Error> {
+        var result:uint8[] = []
+        while !self.complete {
+            var bytes:uint8[] = []
+            match self.read() {
+                success(value) => { bytes = value }
+                failure(error) => { return Result<uint8[], HTTP.Error>.failure(error) }
+            }
+            for byte in bytes { result.append(byte) }
+        }
+        return Result<uint8[], HTTP.Error>.success(result)
+    }
+
+    func copy_to<W:IO.Writer>(output:&W) Result<int, HTTP.Error> {
+        var copied = 0
+        while !self.complete {
+            var bytes:uint8[] = []
+            match self.read() {
+                success(value) => { bytes = value }
+                failure(error) => { return Result<int, HTTP.Error>.failure(error) }
+            }
+            if !bytes.is_empty() {
+                match self.deadline_value().check("HTTP response copy") {
+                    success => {}
+                    failure(error) => { return Result<int, HTTP.Error>.failure(error) }
+                }
+                match IO.write_all<W>(output, @bytes[0:bytes.count()]) {
+                    success => {}
+                    failure(error) => {
+                        return Result<int, HTTP.Error>.failure(HTTP.failure(
+                            HTTP.ErrorKind.body_stream, error.subject, error.detail
+                        ))
+                    }
+                }
+                copied += bytes.count()
+            }
+        }
+        return Result<int, HTTP.Error>.success(copied)
+    }
+
+    func discard() Result<void, HTTP.Error> {
+        while !self.complete {
+            match self.read() {
+                success(bytes) => {}
+                failure(error) => { return Result<void, HTTP.Error>.failure(error) }
+            }
+        }
+        return Result<void, HTTP.Error>.success()
+    }
+
+    func close() Result<void, HTTP.Error> {
+        self.complete = true
+        if var stream = self.connection {
+            self.connection = null
+            return stream.close()
+        }
+        return Result<void, HTTP.Error>.success()
+    }
+
+    private func read_close_delimited(
+        stream:Connection,
+        maximum_bytes:int
+    ) Result<uint8[], HTTP.Error> {
+        var connection = stream
+        var result:uint8[] = []
+        while result.count() < maximum_bytes {
+            match self.deadline_value().check("HTTP response body") {
+                success => {}
+                failure(error) => { return Result<uint8[], HTTP.Error>.failure(error) }
+            }
+            var byte:uint8[1]
+            var count = 0
+            {
+                var view = &byte[0:1]
+                match connection.read(view) {
+                    success(value) => { count = value }
+                    failure(error) => {
+                        return Result<uint8[], HTTP.Error>.failure(HTTP.failure(
+                            HTTP.ErrorKind.network, error.subject, error.detail
+                        ))
+                    }
+                }
+            }
+            match self.deadline_value().check("HTTP response body") {
+                success => {}
+                failure(error) => { return Result<uint8[], HTTP.Error>.failure(error) }
+            }
+            if count == 0 { self.complete = true; return Result<uint8[], HTTP.Error>.success(result) }
+            result.append(byte[0])
+            self.total++
+            if self.total > self.limits.maximum_body_bytes {
+                return Result<uint8[], HTTP.Error>.failure(HTTP.failure(
+                    HTTP.ErrorKind.body_limit, null, "close-delimited HTTP body exceeds maximum_body_bytes"
+                ))
+            }
+        }
+        return Result<uint8[], HTTP.Error>.success(result)
+    }
+
+    private func read_chunk(
+        stream:Connection,
+        maximum_bytes:int
+    ) Result<uint8[], HTTP.Error> {
+        var connection = stream
+        while self.chunk_remaining == 0 {
+            var budget = self.metadata_budget
+            var line = ""
+            match Codec.read_line<Connection>(connection, budget, "HTTP chunk size", self.deadline_value()) {
+                success(value) => { line = value }
+                failure(error) => { return Result<uint8[], HTTP.Error>.failure(error) }
+            }
+            self.metadata_budget = budget
+            let size = Codec.parse_chunk_size(line)
+            if size < 0 {
+                return Result<uint8[], HTTP.Error>.failure(HTTP.failure(
+                    HTTP.ErrorKind.malformed_message, null, "HTTP chunk size is not hexadecimal"
+                ))
+            }
+            if size == 0 {
+                match self.read_trailers(connection) {
+                    success => {}
+                    failure(error) => { return Result<uint8[], HTTP.Error>.failure(error) }
+                }
+                self.complete = true
+                return Result<uint8[], HTTP.Error>.success([])
+            }
+            if size > self.limits.maximum_body_bytes - self.total {
+                return Result<uint8[], HTTP.Error>.failure(HTTP.failure(
+                    HTTP.ErrorKind.body_limit, null, "HTTP chunked body exceeds maximum_body_bytes"
+                ))
+            }
+            self.chunk_remaining = size
+        }
+        var count = self.chunk_remaining
+        if count > maximum_bytes { count = maximum_bytes }
+        var bytes:uint8[] = []
+        match Codec.read_count<Connection>(connection, count, self.deadline_value()) {
+            success(value) => { bytes = value }
+            failure(error) => { return Result<uint8[], HTTP.Error>.failure(error) }
+        }
+        self.chunk_remaining -= bytes.count()
+        self.total += bytes.count()
+        if self.chunk_remaining == 0 {
+            var ending:uint8[] = []
+            match Codec.read_count<Connection>(connection, 2, self.deadline_value()) {
+                success(value) => { ending = value }
+                failure(error) => { return Result<uint8[], HTTP.Error>.failure(error) }
+            }
+            if ending[0] != 13 || ending[1] != 10 {
+                return Result<uint8[], HTTP.Error>.failure(HTTP.failure(
+                    HTTP.ErrorKind.malformed_message, null, "HTTP chunk is not followed by CRLF"
+                ))
+            }
+        }
+        return Result<uint8[], HTTP.Error>.success(bytes)
+    }
+
+    private func read_trailers(stream:Connection) Result<void, HTTP.Error> {
+        var connection = stream
+        var count = 0
+        while true {
+            var budget = self.metadata_budget
+            var line = ""
+            match Codec.read_line<Connection>(connection, budget, "HTTP trailer", self.deadline_value()) {
+                success(value) => { line = value }
+                failure(error) => { return Result<void, HTTP.Error>.failure(error) }
+            }
+            self.metadata_budget = budget
+            if line == "" { return Result<void, HTTP.Error>.success() }
+            count++
+            if count > self.limits.maximum_headers {
+                return Result<void, HTTP.Error>.failure(HTTP.failure(
+                    HTTP.ErrorKind.header_limit, null, "HTTP trailers exceed maximum_headers"
+                ))
+            }
+            var header = HTTP.Header(name:"", value:"")
+            match Codec.parse_header_line(line) {
+                success(value) => { header = value }
+                failure(error) => { return Result<void, HTTP.Error>.failure(error) }
+            }
+            let name = HTTP.ascii_lower(header.name)
+            if name == "content-length" || name == "transfer-encoding" || name == "host" {
+                return Result<void, HTTP.Error>.failure(HTTP.failure(
+                    HTTP.ErrorKind.malformed_message, null, "HTTP trailer contains a forbidden framing field"
+                ))
+            }
+        }
+        panic("HTTP trailer reader terminated unexpectedly")
+    }
+
+    drop { match self.close() { success => {}; failure(error) => {} } }
+
+    private func metadata_value() HTTP.Response {
+        if var value = self.metadata { return value }
+        panic("incoming HTTP response metadata is unavailable")
+    }
+
+    private func deadline_value() HTTP.DeadlineBudget {
+        if var value = self.deadline { return value }
+        panic("incoming HTTP response deadline is unavailable")
+    }
+}
+
+func standard_error(operation:str, detail:str) StandardError {
+    return StandardError(
+        kind:StandardError.Kind.other,
+        operation:operation,
+        subject:null,
+        detail:detail
     )
 }
 
 public func get(url:str) Result<HTTP.Response, HTTP.Error> {
     return get(url, default_options())
+}
+
+public func open(url:str) Result<IncomingResponse, HTTP.Error> {
+    return open(url, default_options())
+}
+
+public func open(url:str, options:Options) Result<IncomingResponse, HTTP.Error> {
+    let parsed = try HTTP.Url.parse(url)
+    var request = HTTP.Request.get(parsed.target)
+    return open_parsed(parsed, request, options)
+}
+
+public func open_request(
+    url:str,
+    request:HTTP.Request
+) Result<IncomingResponse, HTTP.Error> {
+    return open_request(url, request, default_options())
+}
+
+public func open_request(
+    url:str,
+    request:HTTP.Request,
+    options:Options
+) Result<IncomingResponse, HTTP.Error> {
+    let parsed = try HTTP.Url.parse(url)
+    return open_parsed(parsed, request, options)
 }
 
 public func get(url:str, options:Options) Result<HTTP.Response, HTTP.Error> {
@@ -161,6 +650,105 @@ struct DownloadResult {
     let streamed:bool
 }
 
+func open_parsed(
+    url:HTTP.Url,
+    request:HTTP.Request,
+    options:Options
+) Result<IncomingResponse, HTTP.Error> {
+    try validate_options(options)
+    var deadline = HTTP.DeadlineBudget(options.total_timeout_milliseconds)
+    var current_url = url
+    var current_request = request
+    var redirects = 0
+    while true {
+        prepare_request(current_url, current_request)
+        var incoming = try open_once(current_url, current_request, options, deadline)
+        var response = incoming.response()
+        if !response.is_redirect() || options.maximum_redirects == 0 {
+            return Result<IncomingResponse, HTTP.Error>.success(incoming)
+        }
+        var location = ""
+        if let value = response.location() { location = value }
+        else { return Result<IncomingResponse, HTTP.Error>.success(incoming) }
+        if redirects >= options.maximum_redirects {
+            match incoming.close() { success => {}; failure(error) => {} }
+            return Result<IncomingResponse, HTTP.Error>.failure(HTTP.failure(
+                HTTP.ErrorKind.redirect_limit, location, "HTTP redirect limit exceeded"
+            ))
+        }
+        let next_url = try current_url.resolve(location)
+        if current_url.scheme == "https" && next_url.scheme == "http" && !options.allow_insecure_redirects {
+            match incoming.close() { success => {}; failure(error) => {} }
+            return Result<IncomingResponse, HTTP.Error>.failure(HTTP.failure(
+                HTTP.ErrorKind.insecure_redirect,
+                location,
+                "HTTPS redirect to cleartext HTTP is disabled"
+            ))
+        }
+        match incoming.close() { success => {}; failure(error) => {} }
+        current_request = redirect_request(
+            current_request, response.status(), next_url, same_origin(current_url, next_url)
+        )
+        current_url = next_url
+        redirects++
+        try deadline.check("HTTP redirect")
+    }
+    panic("HTTP streaming redirect loop terminated unexpectedly")
+}
+
+func open_once(
+    url:HTTP.Url,
+    request:HTTP.Request,
+    options:Options,
+    deadline:HTTP.DeadlineBudget
+) Result<IncomingResponse, HTTP.Error> {
+    var connection = Connection(null, null)
+    if url.scheme == "http" {
+        var stream = try connect(url, options, deadline)
+        connection = Connection.plain(stream)
+    } elif url.scheme == "https" {
+        var stream = try connect_tls(url, options, deadline)
+        connection = Connection.secure(stream)
+    } else {
+        return Result<IncomingResponse, HTTP.Error>.failure(HTTP.failure(
+            HTTP.ErrorKind.unsupported_scheme, url.scheme, "HTTP supports only http and https URLs"
+        ))
+    }
+    match Codec.write_request<Connection>(connection, request, deadline) {
+        success => {}
+        failure(error) => {
+            close_connection(connection)
+            return Result<IncomingResponse, HTTP.Error>.failure(error)
+        }
+    }
+    var response = HTTP.Response(500)
+    match Codec.read_final_response_head<Connection>(connection, options.limits, deadline) {
+        success(value) => { response = value }
+        failure(error) => {
+            close_connection(connection)
+            return Result<IncomingResponse, HTTP.Error>.failure(error)
+        }
+    }
+    let expect_body = response_has_body(request, response)
+    match IncomingResponse.start(response, connection, options.limits, expect_body, deadline) {
+        success(value) => { return Result<IncomingResponse, HTTP.Error>.success(value) }
+        failure(error) => {
+            close_connection(connection)
+            return Result<IncomingResponse, HTTP.Error>.failure(error)
+        }
+    }
+}
+
+func close_connection(connection:Connection) {
+    match connection.close() { success => {}; failure(error) => {} }
+}
+
+func response_has_body(request:HTTP.Request, response:HTTP.Response) bool {
+    if request.method() == HTTP.Method.head { return false }
+    let status = response.status()
+    return !((status >= 100 && status < 200) || status == 204 || status == 304)
+}
+
 func send_text(
     method:HTTP.Method,
     url:str,
@@ -179,17 +767,15 @@ func send_parsed(
     request:HTTP.Request,
     options:Options
 ) Result<HTTP.Response, HTTP.Error> {
-    if options.maximum_redirects < 0 {
-        return Result<HTTP.Response, HTTP.Error>.failure(HTTP.failure(
-            HTTP.ErrorKind.redirect_limit, null, "maximum_redirects must be non-negative"
-        ))
-    }
+    try validate_options(options)
+    var deadline = HTTP.DeadlineBudget(options.total_timeout_milliseconds)
     var current_url = url
     var current_request = request
     var redirects = 0
     while true {
         prepare_request(current_url, current_request)
-        var response = try send_once(current_url, current_request, options)
+        try deadline.check("HTTP request")
+        var response = try send_once(current_url, current_request, options, deadline)
         if !response.is_redirect() || options.maximum_redirects == 0 { return Result<HTTP.Response, HTTP.Error>.success(response) }
         var location = ""
         if let value = response.location() { location = value }
@@ -200,6 +786,7 @@ func send_parsed(
             ))
         }
         let next_url = try current_url.resolve(location)
+        try deadline.check("HTTP redirect")
         if current_url.scheme == "https" && next_url.scheme == "http" && !options.allow_insecure_redirects {
             return Result<HTTP.Response, HTTP.Error>.failure(HTTP.failure(
                 HTTP.ErrorKind.insecure_redirect,
@@ -217,10 +804,11 @@ func send_parsed(
 func send_once(
     url:HTTP.Url,
     request:HTTP.Request,
-    options:Options
+    options:Options,
+    deadline:HTTP.DeadlineBudget
 ) Result<HTTP.Response, HTTP.Error> {
-    if url.scheme == "http" { return send_tcp(url, request, options) }
-    if url.scheme == "https" { return send_tls(url, request, options) }
+    if url.scheme == "http" { return send_tcp(url, request, options, deadline) }
+    if url.scheme == "https" { return send_tls(url, request, options, deadline) }
     return Result<HTTP.Response, HTTP.Error>.failure(HTTP.failure(
         HTTP.ErrorKind.unsupported_scheme,
         url.scheme,
@@ -231,7 +819,7 @@ func send_once(
 func prepare_request(url:HTTP.Url, request:HTTP.Request) {
     var headers = request.headers()
     headers.set("Host", url.authority())
-    if !headers.contains("User-Agent") { headers.set("User-Agent", "Silex-HTTP/0.2") }
+    if !headers.contains("User-Agent") { headers.set("User-Agent", "Silex-HTTP/0.3") }
 }
 
 package func redirect_request(
@@ -270,52 +858,54 @@ package func same_origin(left:HTTP.Url, right:HTTP.Url) bool {
         left.port == right.port
 }
 
-func send_tcp(url:HTTP.Url, request:HTTP.Request, options:Options) Result<HTTP.Response, HTTP.Error> {
-    var stream = try connect(url, options)
-    match Codec.write_request<TCP.Stream>(stream, request) {
+func send_tcp(
+    url:HTTP.Url,
+    request:HTTP.Request,
+    options:Options,
+    deadline:HTTP.DeadlineBudget
+) Result<HTTP.Response, HTTP.Error> {
+    var stream = try connect(url, options, deadline)
+    match Codec.write_request<TCP.Stream>(stream, request, deadline) {
         failure(error) => {
             close_stream(stream)
             return Result<HTTP.Response, HTTP.Error>.failure(error)
         }
         success => {}
     }
-    var result = Codec.read_response<TCP.Stream>(stream, options.limits, request.method() != HTTP.Method.head)
+    var result = Codec.read_response<TCP.Stream>(
+        stream, options.limits, request.method() != HTTP.Method.head, deadline
+    )
     close_stream(stream)
     return result
 }
 
-func send_tls(url:HTTP.Url, request:HTTP.Request, options:Options) Result<HTTP.Response, HTTP.Error> {
-    match TLS.connect(url.host, url.port, TLS.ConnectOptions(
-        read_timeout_milliseconds:options.read_timeout_milliseconds,
-        write_timeout_milliseconds:options.write_timeout_milliseconds
-    )) {
-        success(stream) => {
-            return send_tls_connected(stream, request, options)
-        }
-        failure(error) => {
-            return Result<HTTP.Response, HTTP.Error>.failure(HTTP.failure(
-                HTTP.ErrorKind.secure_transport,
-                error.host,
-                error.detail
-            ))
-        }
-    }
+func send_tls(
+    url:HTTP.Url,
+    request:HTTP.Request,
+    options:Options,
+    deadline:HTTP.DeadlineBudget
+) Result<HTTP.Response, HTTP.Error> {
+    var stream = try connect_tls(url, options, deadline)
+    return send_tls_connected(stream, request, options, deadline)
 }
 
 func send_tls_connected(
     stream:TLS.Stream,
     request:HTTP.Request,
-    options:Options
+    options:Options,
+    deadline:HTTP.DeadlineBudget
 ) Result<HTTP.Response, HTTP.Error> {
     var connection = stream
-    match Codec.write_request<TLS.Stream>(connection, request) {
+    match Codec.write_request<TLS.Stream>(connection, request, deadline) {
         failure(error) => {
             close_tls(connection)
             return Result<HTTP.Response, HTTP.Error>.failure(error)
         }
         success => {}
     }
-    var result = Codec.read_response<TLS.Stream>(connection, options.limits, request.method() != HTTP.Method.head)
+    var result = Codec.read_response<TLS.Stream>(
+        connection, options.limits, request.method() != HTTP.Method.head, deadline
+    )
     close_tls(connection)
     return result
 }
@@ -326,11 +916,8 @@ func download_parsed<W:IO.Writer>(
     output:&W,
     options:Options
 ) Result<HTTP.Response, HTTP.Error> {
-    if options.maximum_redirects < 0 {
-        return Result<HTTP.Response, HTTP.Error>.failure(HTTP.failure(
-            HTTP.ErrorKind.redirect_limit, null, "maximum_redirects must be non-negative"
-        ))
-    }
+    try validate_options(options)
+    var deadline = HTTP.DeadlineBudget(options.total_timeout_milliseconds)
     var current_url = url
     var current_request = request
     var redirects = 0
@@ -341,7 +928,8 @@ func download_parsed<W:IO.Writer>(
             current_request,
             output,
             options,
-            options.maximum_redirects > 0
+            options.maximum_redirects > 0,
+            deadline
         )
         if result.streamed || !result.response.is_redirect() {
             return Result<HTTP.Response, HTTP.Error>.success(result.response)
@@ -355,6 +943,7 @@ func download_parsed<W:IO.Writer>(
             ))
         }
         let next_url = try current_url.resolve(location)
+        try deadline.check("HTTP redirect")
         if current_url.scheme == "https" && next_url.scheme == "http" && !options.allow_insecure_redirects {
             return Result<HTTP.Response, HTTP.Error>.failure(HTTP.failure(
                 HTTP.ErrorKind.insecure_redirect, location, "HTTPS redirect to cleartext HTTP is disabled"
@@ -372,33 +961,27 @@ func download_once<W:IO.Writer>(
     request:HTTP.Request,
     output:&W,
     options:Options,
-    may_follow:bool
+    may_follow:bool,
+    deadline:HTTP.DeadlineBudget
 ) Result<DownloadResult, HTTP.Error> {
     if url.scheme == "http" {
-        var stream = try connect(url, options)
-        match Codec.write_request<TCP.Stream>(stream, request) {
+        var stream = try connect(url, options, deadline)
+        match Codec.write_request<TCP.Stream>(stream, request, deadline) {
             failure(error) => {
                 close_stream(stream)
                 return Result<DownloadResult, HTTP.Error>.failure(error)
             }
             success => {}
         }
-        var result = download_connected<TCP.Stream, W>(stream, request, output, options, may_follow)
+        var result = download_connected<TCP.Stream, W>(
+            stream, request, output, options, may_follow, deadline
+        )
         close_stream(stream)
         return result
     }
     if url.scheme == "https" {
-        match TLS.connect(url.host, url.port, TLS.ConnectOptions(
-            read_timeout_milliseconds:options.read_timeout_milliseconds,
-            write_timeout_milliseconds:options.write_timeout_milliseconds
-        )) {
-            failure(error) => {
-                return Result<DownloadResult, HTTP.Error>.failure(HTTP.failure(
-                    HTTP.ErrorKind.secure_transport, error.host, error.detail
-                ))
-            }
-            success(stream) => { return download_tls_connected<W>(stream, request, output, options, may_follow) }
-        }
+        var stream = try connect_tls(url, options, deadline)
+        return download_tls_connected<W>(stream, request, output, options, may_follow, deadline)
     }
     return Result<DownloadResult, HTTP.Error>.failure(HTTP.failure(
         HTTP.ErrorKind.unsupported_scheme, url.scheme, "HTTP supports only http and https URLs"
@@ -410,17 +993,20 @@ func download_tls_connected<W:IO.Writer>(
     request:HTTP.Request,
     output:&W,
     options:Options,
-    may_follow:bool
+    may_follow:bool,
+    deadline:HTTP.DeadlineBudget
 ) Result<DownloadResult, HTTP.Error> {
     var connection = stream
-    match Codec.write_request<TLS.Stream>(connection, request) {
+    match Codec.write_request<TLS.Stream>(connection, request, deadline) {
         failure(error) => {
             close_tls(connection)
             return Result<DownloadResult, HTTP.Error>.failure(error)
         }
         success => {}
     }
-    var result = download_connected<TLS.Stream, W>(connection, request, output, options, may_follow)
+    var result = download_connected<TLS.Stream, W>(
+        connection, request, output, options, may_follow, deadline
+    )
     close_tls(connection)
     return result
 }
@@ -430,14 +1016,17 @@ func download_connected<T:IO.Reader, W:IO.Writer>(
     request:HTTP.Request,
     output:&W,
     options:Options,
-    may_follow:bool
+    may_follow:bool,
+    deadline:HTTP.DeadlineBudget
 ) Result<DownloadResult, HTTP.Error> {
-    var response = try Codec.read_final_response_head<T>(connection, options.limits)
+    var response = try Codec.read_final_response_head<T>(connection, options.limits, deadline)
     if may_follow && response.is_redirect() && response.location() != null {
         return Result<DownloadResult, HTTP.Error>.success(DownloadResult(response:response, streamed:false))
     }
     if request.method() != HTTP.Method.head {
-        try Codec.copy_body<T, W>(connection, output, response.headers(), options.limits, true)
+        try Codec.copy_body<T, W>(
+            connection, output, response.headers(), options.limits, true, deadline
+        )
     }
     return Result<DownloadResult, HTTP.Error>.success(DownloadResult(response:response, streamed:true))
 }
@@ -449,11 +1038,13 @@ func send_stream_parsed<R:IO.Reader>(
     content_length:int,
     options:Options
 ) Result<HTTP.Response, HTTP.Error> {
+    try validate_options(options)
+    var deadline = HTTP.DeadlineBudget(options.total_timeout_milliseconds)
     prepare_request(url, request)
     if url.scheme == "http" {
-        var stream = try connect(url, options)
+        var stream = try connect(url, options, deadline)
         match Codec.write_request_from<TCP.Stream, R>(
-            stream, request, input, content_length, options.limits.maximum_body_bytes
+            stream, request, input, content_length, options.limits.maximum_body_bytes, deadline
         ) {
             failure(error) => {
                 close_stream(stream)
@@ -461,24 +1052,17 @@ func send_stream_parsed<R:IO.Reader>(
             }
             success => {}
         }
-        var result = Codec.read_response<TCP.Stream>(stream, options.limits, request.method() != HTTP.Method.head)
+        var result = Codec.read_response<TCP.Stream>(
+            stream, options.limits, request.method() != HTTP.Method.head, deadline
+        )
         close_stream(stream)
         return result
     }
     if url.scheme == "https" {
-        match TLS.connect(url.host, url.port, TLS.ConnectOptions(
-            read_timeout_milliseconds:options.read_timeout_milliseconds,
-            write_timeout_milliseconds:options.write_timeout_milliseconds
-        )) {
-            failure(error) => {
-                return Result<HTTP.Response, HTTP.Error>.failure(HTTP.failure(
-                    HTTP.ErrorKind.secure_transport, error.host, error.detail
-                ))
-            }
-            success(stream) => {
-                return send_stream_tls_connected<R>(stream, request, input, content_length, options)
-            }
-        }
+        var stream = try connect_tls(url, options, deadline)
+        return send_stream_tls_connected<R>(
+            stream, request, input, content_length, options, deadline
+        )
     }
     return Result<HTTP.Response, HTTP.Error>.failure(HTTP.failure(
         HTTP.ErrorKind.unsupported_scheme, url.scheme, "HTTP supports only http and https URLs"
@@ -490,11 +1074,12 @@ func send_stream_tls_connected<R:IO.Reader>(
     request:HTTP.Request,
     input:&R,
     content_length:int,
-    options:Options
+    options:Options,
+    deadline:HTTP.DeadlineBudget
 ) Result<HTTP.Response, HTTP.Error> {
     var connection = stream
     match Codec.write_request_from<TLS.Stream, R>(
-        connection, request, input, content_length, options.limits.maximum_body_bytes
+        connection, request, input, content_length, options.limits.maximum_body_bytes, deadline
     ) {
         failure(error) => {
             close_tls(connection)
@@ -502,28 +1087,188 @@ func send_stream_tls_connected<R:IO.Reader>(
         }
         success => {}
     }
-    var result = Codec.read_response<TLS.Stream>(connection, options.limits, request.method() != HTTP.Method.head)
+    var result = Codec.read_response<TLS.Stream>(
+        connection, options.limits, request.method() != HTTP.Method.head, deadline
+    )
     close_tls(connection)
     return result
 }
 
-func connect(url:HTTP.Url, options:Options) Result<TCP.Stream, HTTP.Error> {
-    match TCP.connect(url.host, url.port, TCP.ConnectOptions(
-        connect_timeout_milliseconds:null,
-        stream:TCP.StreamOptions(
-            read_timeout_milliseconds:options.read_timeout_milliseconds,
-            write_timeout_milliseconds:options.write_timeout_milliseconds
+func validate_options(options:Options) Result<void, HTTP.Error> {
+    if options.maximum_redirects < 0 {
+        return Result<void, HTTP.Error>.failure(HTTP.failure(
+            HTTP.ErrorKind.invalid_configuration, null, "maximum_redirects must be non-negative"
+        ))
+    }
+    if negative_timeout(options.connect_timeout_milliseconds) ||
+        negative_timeout(options.read_timeout_milliseconds) ||
+        negative_timeout(options.write_timeout_milliseconds) ||
+        negative_timeout(options.total_timeout_milliseconds) {
+        return Result<void, HTTP.Error>.failure(HTTP.failure(
+            HTTP.ErrorKind.invalid_configuration, null, "HTTP timeouts must be non-negative"
+        ))
+    }
+    if options.limits.maximum_header_bytes < 0 || options.limits.maximum_headers < 0 ||
+        options.limits.maximum_body_bytes < 0 || options.limits.maximum_informational_responses < 0 {
+        return Result<void, HTTP.Error>.failure(HTTP.failure(
+            HTTP.ErrorKind.invalid_configuration, null, "HTTP limits must be non-negative"
+        ))
+    }
+    return Result<void, HTTP.Error>.success()
+}
+
+func negative_timeout(value:int?) bool {
+    if let milliseconds = value { return milliseconds < 0 }
+    return false
+}
+
+func connect(
+    url:HTTP.Url,
+    options:Options,
+    deadline:HTTP.DeadlineBudget
+) Result<TCP.Stream, HTTP.Error> {
+    let endpoints = try resolve_endpoints(url, options, deadline)
+    var last:HTTP.Error? = null
+    for endpoint in endpoints {
+        let connect_timeout = options.connect_timeout_milliseconds
+        let read_timeout = try deadline.bounded_timeout(
+            options.read_timeout_milliseconds, "HTTP read"
         )
+        let write_timeout = try deadline.bounded_timeout(
+            options.write_timeout_milliseconds, "HTTP write"
+        )
+        match TCP.connect(endpoint, TCP.ConnectOptions(
+            connect_timeout_milliseconds:connect_timeout,
+            stream:TCP.StreamOptions(
+                read_timeout_milliseconds:read_timeout,
+                write_timeout_milliseconds:write_timeout
+            )
+        )) {
+            success(value) => { return Result<TCP.Stream, HTTP.Error>.success(value) }
+            failure(error) => {
+                last = HTTP.failure(HTTP.ErrorKind.network, error.subject, error.detail)
+            }
+        }
+    }
+    if error = last { return Result<TCP.Stream, HTTP.Error>.failure(error) }
+    return Result<TCP.Stream, HTTP.Error>.failure(HTTP.failure(
+        HTTP.ErrorKind.network, url.host, "HTTP name resolution returned no usable endpoint"
+    ))
+}
+
+func connect_tls(
+    url:HTTP.Url,
+    options:Options,
+    deadline:HTTP.DeadlineBudget
+) Result<TLS.Stream, HTTP.Error> {
+    let endpoints = try resolve_endpoints(url, options, deadline)
+    var last:HTTP.Error? = null
+    for endpoint in endpoints {
+        let connect_timeout = options.connect_timeout_milliseconds
+        let read_timeout = try deadline.bounded_timeout(
+            options.read_timeout_milliseconds, "HTTPS read"
+        )
+        let write_timeout = try deadline.bounded_timeout(
+            options.write_timeout_milliseconds, "HTTPS write"
+        )
+        match TLS.connect_endpoint(endpoint, url.host, TLS.ConnectOptions(
+            connect_timeout_milliseconds:connect_timeout,
+            read_timeout_milliseconds:read_timeout,
+            write_timeout_milliseconds:write_timeout
+        )) {
+            success(value) => { return Result<TLS.Stream, HTTP.Error>.success(value) }
+            failure(error) => {
+                last = HTTP.failure(HTTP.ErrorKind.secure_transport, error.host, error.detail)
+            }
+        }
+    }
+    if error = last { return Result<TLS.Stream, HTTP.Error>.failure(error) }
+    return Result<TLS.Stream, HTTP.Error>.failure(HTTP.failure(
+        HTTP.ErrorKind.network, url.host, "HTTPS name resolution returned no usable endpoint"
+    ))
+}
+
+func resolve_endpoints(
+    url:HTTP.Url,
+    options:Options,
+    deadline:HTTP.DeadlineBudget
+) Result<Network.Endpoint[], HTTP.Error> {
+    try deadline.check("HTTP name resolution")
+    var resolved:Network.Endpoint[] = []
+    match Network.resolve(url.host, url.port, Network.ResolveOptions(
+        family:Network.Family.any(),
+        transport:Network.Transport.stream()
     )) {
-        success(value) => { return Result<TCP.Stream, HTTP.Error>.success(value) }
+        success(value) => { resolved = value }
         failure(error) => {
-            return Result<TCP.Stream, HTTP.Error>.failure(HTTP.failure(
-                HTTP.ErrorKind.network,
-                error.subject,
-                error.detail
+            return Result<Network.Endpoint[], HTTP.Error>.failure(HTTP.failure(
+                HTTP.ErrorKind.network, error.subject, error.detail
             ))
         }
     }
+    try deadline.check("HTTP name resolution")
+    var allowed:Network.Endpoint[] = []
+    for endpoint in resolved {
+        if endpoint_allowed(endpoint, options.address_policy) { allowed.append(endpoint) }
+    }
+    if !allowed.is_empty() { return Result<Network.Endpoint[], HTTP.Error>.success(allowed) }
+    if options.address_policy == AddressPolicy.public_only && !resolved.is_empty() {
+        return Result<Network.Endpoint[], HTTP.Error>.failure(HTTP.failure(
+            HTTP.ErrorKind.network_policy,
+            url.host,
+            "HTTP public-network policy rejected every resolved address"
+        ))
+    }
+    return Result<Network.Endpoint[], HTTP.Error>.failure(HTTP.failure(
+        HTTP.ErrorKind.network, url.host, "HTTP name resolution returned no endpoint"
+    ))
+}
+
+package func endpoint_allowed(endpoint:Network.Endpoint, policy:AddressPolicy) bool {
+    if policy == AddressPolicy.unrestricted { return true }
+    return match endpoint.address {
+        ipv4(bytes) => ipv4_is_public(bytes)
+        ipv6(bytes) => ipv6_is_public(bytes)
+    }
+}
+
+func ipv4_is_public(bytes:uint8[4]) bool {
+    if bytes[0] == 0 || bytes[0] == 10 || bytes[0] == 127 { return false }
+    if bytes[0] == 169 && bytes[1] == 254 { return false }
+    if bytes[0] == 172 && bytes[1] >= 16 && bytes[1] <= 31 { return false }
+    if bytes[0] == 192 && bytes[1] == 168 { return false }
+    if bytes[0] >= 224 { return false }
+    return true
+}
+
+func ipv6_is_public(bytes:uint8[16]) bool {
+    var all_zero = true
+    var index = 0
+    while index < 16 {
+        if bytes[index] != 0 { all_zero = false }
+        index++
+    }
+    if all_zero { return false }
+    var loopback = true
+    index = 0
+    while index < 15 {
+        if bytes[index] != 0 { loopback = false }
+        index++
+    }
+    if loopback && bytes[15] == 1 { return false }
+    if (bytes[0] & 0xFE) == 0xFC { return false }
+    if bytes[0] == 0xFE && (bytes[1] & 0xC0) == 0x80 { return false }
+    if bytes[0] == 0xFF { return false }
+    var mapped = true
+    index = 0
+    while index < 10 {
+        if bytes[index] != 0 { mapped = false }
+        index++
+    }
+    if mapped && bytes[10] == 0xFF && bytes[11] == 0xFF {
+        return ipv4_is_public([bytes[12], bytes[13], bytes[14], bytes[15]])
+    }
+    return true
 }
 
 func close_stream(stream:TCP.Stream) {

@@ -1,8 +1,10 @@
 use HTTP
 use HTTP.Client
 use HTTP.Codec
+use HTTP.Server
 use STD.Error
 use STD.IO
+use STD.Network
 use STD.Text.UTF8
 
 class MemoryStream:IO.Reader, IO.Writer {
@@ -308,4 +310,123 @@ test "rewrite and sanitize redirected requests" {
     assert(preserved.method() == HTTP.Method.post)
     assert(preserved.headers().contains("Authorization"))
     assert(require_text(preserved.text()) == "credentials")
+}
+
+test "construct untrusted HTTP values without panicking" {
+    var headers = HTTP.Headers()
+    match headers.try_append("Bad Header", "value") {
+        success => { panic("invalid header name should fail") }
+        failure(error) => { assert(error.kind == HTTP.ErrorKind.invalid_header) }
+    }
+    match headers.try_set("X-Test", "line\nfeed") {
+        success => { panic("invalid header value should fail") }
+        failure(error) => { assert(error.kind == HTTP.ErrorKind.invalid_header) }
+    }
+    assert(headers.count() == 0)
+    match HTTP.Request.try_new(HTTP.Method.custom("BAD METHOD"), "/") {
+        success(request) => { panic("invalid custom method should fail") }
+        failure(error) => { assert(error.kind == HTTP.ErrorKind.invalid_request) }
+    }
+    match HTTP.Response.try_new(42) {
+        success(response) => { panic("invalid response status should fail") }
+        failure(error) => { assert(error.kind == HTTP.ErrorKind.invalid_response) }
+    }
+}
+
+test "configure client and server time budgets fluently" {
+    let client = Client.default_options()
+        .with_connect_timeout(1_000)
+        .with_read_timeout(2_000)
+        .with_write_timeout(3_000)
+        .with_total_timeout(4_000)
+        .with_public_network_only()
+    if let value = client.connect_timeout_milliseconds { assert(value == 1_000) }
+    else { panic("connect timeout should be configured") }
+    if let value = client.read_timeout_milliseconds { assert(value == 2_000) }
+    else { panic("read timeout should be configured") }
+    if let value = client.write_timeout_milliseconds { assert(value == 3_000) }
+    else { panic("write timeout should be configured") }
+    if let value = client.total_timeout_milliseconds { assert(value == 4_000) }
+    else { panic("total timeout should be configured") }
+    assert(client.address_policy == Client.AddressPolicy.public_only)
+
+    let server = Server.default_options()
+        .with_backlog(16)
+        .with_accept_timeout(500)
+        .with_read_timeout(1_000)
+        .with_write_timeout(2_000)
+        .with_connection_timeout(3_000)
+    assert(server.backlog == 16)
+    if let value = server.accept_timeout_milliseconds { assert(value == 500) }
+    else { panic("accept timeout should be configured") }
+    if let value = server.read_timeout_milliseconds { assert(value == 1_000) }
+    else { panic("server read timeout should be configured") }
+    if let value = server.write_timeout_milliseconds { assert(value == 2_000) }
+    else { panic("server write timeout should be configured") }
+    if let value = server.connection_timeout_milliseconds { assert(value == 3_000) }
+    else { panic("connection timeout should be configured") }
+}
+
+test "reject non-public resolved endpoints with the optional client policy" {
+    let policy = Client.AddressPolicy.public_only
+    assert(!Client.endpoint_allowed(Network.Endpoint(
+        address:Network.IpAddress.ipv4([127, 0, 0, 1]), port:80, scope_id:0
+    ), policy))
+    assert(!Client.endpoint_allowed(Network.Endpoint(
+        address:Network.IpAddress.ipv4([10, 1, 2, 3]), port:80, scope_id:0
+    ), policy))
+    assert(!Client.endpoint_allowed(Network.Endpoint(
+        address:Network.IpAddress.ipv6([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+        port:80,
+        scope_id:0
+    ), policy))
+    assert(Client.endpoint_allowed(Network.Endpoint(
+        address:Network.IpAddress.ipv4([93, 184, 216, 34]), port:80, scope_id:0
+    ), policy))
+}
+
+test "stop codec work when the total deadline expires" {
+    var stream = MemoryStream("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+    var deadline = HTTP.DeadlineBudget(0)
+    match Codec.read_response(stream, HTTP.default_limits(), true, deadline) {
+        success(response) => { panic("expired deadline should fail") }
+        failure(error) => { assert(error.kind == HTTP.ErrorKind.deadline_exceeded) }
+    }
+}
+
+test "stream fixed and chunked server responses" {
+    var fixed_input = MemoryStream("streamed")
+    var fixed_output = MemoryStream("")
+    var fixed_response = HTTP.Response(200, "OK")
+    fixed_response.headers().set("Content-Type", "application/octet-stream")
+    var fixed_deadline = HTTP.DeadlineBudget(null)
+    match Codec.write_response_from(
+        fixed_output, fixed_response, fixed_input, 8, 32, true, fixed_deadline
+    ) {
+        success => {}
+        failure(error) => { panic(error.detail) }
+    }
+    assert(fixed_output.written_text() ==
+        "HTTP/1.1 200 OK\r\n" +
+        "Content-Type: application/octet-stream\r\n" +
+        "Content-Length: 8\r\n" +
+        "Connection: close\r\n\r\nstreamed"
+    )
+
+    var chunked_input = MemoryStream("hello")
+    var chunked_output = MemoryStream("")
+    var chunked_response = HTTP.Response(200, "OK")
+    var chunked_deadline = HTTP.DeadlineBudget(null)
+    match Codec.write_response_chunked(
+        chunked_output, chunked_response, chunked_input, 32, true, chunked_deadline
+    ) {
+        success => {}
+        failure(error) => { panic(error.detail) }
+    }
+    assert(chunked_output.written_text() ==
+        "HTTP/1.1 200 OK\r\n" +
+        "Transfer-Encoding: chunked\r\n" +
+        "Connection: close\r\n\r\n" +
+        "5\r\nhello\r\n0\r\n\r\n"
+    )
 }

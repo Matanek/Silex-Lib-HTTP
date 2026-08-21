@@ -1,4 +1,5 @@
 use HTTP
+use STD.Error as StandardError
 use STD.IO
 use STD.Text.UTF8
 
@@ -8,15 +9,33 @@ package struct BodyFraming {
 }
 
 package func read_request<T:IO.Reader>(reader:&T, limits:HTTP.Limits) Result<HTTP.Request, HTTP.Error> {
-    var request = try read_request_head<T>(reader, limits)
-    var body = try read_body<T>(reader, request.headers(), limits, false)
+    var deadline = HTTP.DeadlineBudget(null)
+    return read_request<T>(reader, limits, deadline)
+}
+
+package func read_request<T:IO.Reader>(
+    reader:&T,
+    limits:HTTP.Limits,
+    deadline:HTTP.DeadlineBudget
+) Result<HTTP.Request, HTTP.Error> {
+    var request = try read_request_head<T>(reader, limits, deadline)
+    var body = try read_body<T>(reader, request.headers(), limits, false, deadline)
     request.set_body(body)
     return Result<HTTP.Request, HTTP.Error>.success(request)
 }
 
 package func read_request_head<T:IO.Reader>(reader:&T, limits:HTTP.Limits) Result<HTTP.Request, HTTP.Error> {
+    var deadline = HTTP.DeadlineBudget(null)
+    return read_request_head<T>(reader, limits, deadline)
+}
+
+package func read_request_head<T:IO.Reader>(
+    reader:&T,
+    limits:HTTP.Limits,
+    deadline:HTTP.DeadlineBudget
+) Result<HTTP.Request, HTTP.Error> {
     var remaining_headers = limits.maximum_header_bytes
-    var start = try read_line<T>(reader, remaining_headers, "HTTP request line")
+    var start = try read_line<T>(reader, remaining_headers, "HTTP request line", deadline)
     let parts = split_spaces(start)
     if parts.count() != 3 || parts[0] == "" || parts[1] == "" || parts[2] != "HTTP/1.1" {
         return fail_request(HTTP.ErrorKind.malformed_message, "request line must be METHOD target HTTP/1.1")
@@ -27,7 +46,7 @@ package func read_request_head<T:IO.Reader>(reader:&T, limits:HTTP.Limits) Resul
     if !HTTP.valid_request_target(parts[1]) {
         return fail_request(HTTP.ErrorKind.malformed_message, "request target contains an invalid byte")
     }
-    var headers = try read_headers<T>(reader, limits, remaining_headers)
+    var headers = try read_headers<T>(reader, limits, remaining_headers, deadline)
     let hosts = headers.get_all("Host")
     if hosts.count() != 1 || HTTP.trim(hosts[0]) == "" {
         return fail_request(HTTP.ErrorKind.malformed_message, "HTTP/1.1 request requires exactly one non-empty Host header")
@@ -42,17 +61,36 @@ package func read_response<T:IO.Reader>(
     limits:HTTP.Limits,
     expect_body:bool
 ) Result<HTTP.Response, HTTP.Error> {
-    var response = try read_final_response_head<T>(reader, limits)
+    var deadline = HTTP.DeadlineBudget(null)
+    return read_response<T>(reader, limits, expect_body, deadline)
+}
+
+package func read_response<T:IO.Reader>(
+    reader:&T,
+    limits:HTTP.Limits,
+    expect_body:bool,
+    deadline:HTTP.DeadlineBudget
+) Result<HTTP.Response, HTTP.Error> {
+    var response = try read_final_response_head<T>(reader, limits, deadline)
     if expect_body && !body_forbidden(response.status()) {
-        var body = try read_body<T>(reader, response.headers(), limits, true)
+        var body = try read_body<T>(reader, response.headers(), limits, true, deadline)
         response.replace_body(body)
     }
     return Result<HTTP.Response, HTTP.Error>.success(response)
 }
 
 package func read_response_head<T:IO.Reader>(reader:&T, limits:HTTP.Limits) Result<HTTP.Response, HTTP.Error> {
+    var deadline = HTTP.DeadlineBudget(null)
+    return read_response_head<T>(reader, limits, deadline)
+}
+
+package func read_response_head<T:IO.Reader>(
+    reader:&T,
+    limits:HTTP.Limits,
+    deadline:HTTP.DeadlineBudget
+) Result<HTTP.Response, HTTP.Error> {
     var remaining_headers = limits.maximum_header_bytes
-    var start = try read_line<T>(reader, remaining_headers, "HTTP status line")
+    var start = try read_line<T>(reader, remaining_headers, "HTTP status line", deadline)
     if !starts_with(start, "HTTP/1.1 ") && !starts_with(start, "HTTP/1.0 ") {
         return fail_response(HTTP.ErrorKind.malformed_message, "status line must begin with HTTP/1.1 or HTTP/1.0")
     }
@@ -66,7 +104,7 @@ package func read_response_head<T:IO.Reader>(reader:&T, limits:HTTP.Limits) Resu
     let status = ((bytes[9] - 48) as int) * 100 + ((bytes[10] - 48) as int) * 10 + (bytes[11] - 48) as int
     var reason = ""
     if bytes.count() > 13 { reason = bytes_text(bytes, 13, bytes.count()) }
-    var headers = try read_headers<T>(reader, limits, remaining_headers)
+    var headers = try read_headers<T>(reader, limits, remaining_headers, deadline)
     var response = HTTP.Response(status, reason)
     response.replace_headers(headers)
     return Result<HTTP.Response, HTTP.Error>.success(response)
@@ -76,12 +114,21 @@ package func read_final_response_head<T:IO.Reader>(
     reader:&T,
     limits:HTTP.Limits
 ) Result<HTTP.Response, HTTP.Error> {
+    var deadline = HTTP.DeadlineBudget(null)
+    return read_final_response_head<T>(reader, limits, deadline)
+}
+
+package func read_final_response_head<T:IO.Reader>(
+    reader:&T,
+    limits:HTTP.Limits,
+    deadline:HTTP.DeadlineBudget
+) Result<HTTP.Response, HTTP.Error> {
     if limits.maximum_informational_responses < 0 {
         return fail_response(HTTP.ErrorKind.header_limit, "maximum_informational_responses must be non-negative")
     }
     var informational = 0
     while true {
-        var response = try read_response_head<T>(reader, limits)
+        var response = try read_response_head<T>(reader, limits, deadline)
         if response.status() == 101 {
             return fail_response(HTTP.ErrorKind.unsupported_upgrade, "HTTP protocol upgrades are not supported")
         }
@@ -103,14 +150,34 @@ package func read_response_to<T:IO.Reader, W:IO.Writer>(
     limits:HTTP.Limits,
     expect_body:bool
 ) Result<HTTP.Response, HTTP.Error> {
-    var response = try read_final_response_head<T>(reader, limits)
+    var deadline = HTTP.DeadlineBudget(null)
+    return read_response_to<T, W>(reader, output, limits, expect_body, deadline)
+}
+
+package func read_response_to<T:IO.Reader, W:IO.Writer>(
+    reader:&T,
+    output:&W,
+    limits:HTTP.Limits,
+    expect_body:bool,
+    deadline:HTTP.DeadlineBudget
+) Result<HTTP.Response, HTTP.Error> {
+    var response = try read_final_response_head<T>(reader, limits, deadline)
     if expect_body && !body_forbidden(response.status()) {
-        try copy_body<T, W>(reader, output, response.headers(), limits, true)
+        try copy_body<T, W>(reader, output, response.headers(), limits, true, deadline)
     }
     return Result<HTTP.Response, HTTP.Error>.success(response)
 }
 
 package func write_request<T:IO.Writer>(writer:&T, request:@HTTP.Request) Result<void, HTTP.Error> {
+    var deadline = HTTP.DeadlineBudget(null)
+    return write_request<T>(writer, request, deadline)
+}
+
+package func write_request<T:IO.Writer>(
+    writer:&T,
+    request:@HTTP.Request,
+    deadline:HTTP.DeadlineBudget
+) Result<void, HTTP.Error> {
     var bytes:uint8[] = []
     append_text(bytes, HTTP.method_text(request.method()) + " " + request.target() + " HTTP/1.1\r\n")
     var headers = request.headers()
@@ -119,7 +186,7 @@ package func write_request<T:IO.Writer>(writer:&T, request:@HTTP.Request) Result
     append_text(bytes, "Content-Length: " + HTTP.decimal(body.count()) + "\r\n")
     append_text(bytes, "Connection: close\r\n\r\n")
     for byte in body { bytes.append(byte) }
-    return write_bytes<T>(writer, bytes)
+    return write_bytes<T>(writer, bytes, deadline)
 }
 
 package func write_request_from<T:IO.Writer, R:IO.Reader>(
@@ -128,6 +195,18 @@ package func write_request_from<T:IO.Writer, R:IO.Reader>(
     input:&R,
     content_length:int,
     maximum_body_bytes:int
+) Result<void, HTTP.Error> {
+    var deadline = HTTP.DeadlineBudget(null)
+    return write_request_from<T, R>(writer, request, input, content_length, maximum_body_bytes, deadline)
+}
+
+package func write_request_from<T:IO.Writer, R:IO.Reader>(
+    writer:&T,
+    request:@HTTP.Request,
+    input:&R,
+    content_length:int,
+    maximum_body_bytes:int,
+    deadline:HTTP.DeadlineBudget
 ) Result<void, HTTP.Error> {
     if content_length < 0 {
         return Result<void, HTTP.Error>.failure(HTTP.failure(
@@ -151,14 +230,24 @@ package func write_request_from<T:IO.Writer, R:IO.Reader>(
     append_headers(bytes, headers)
     append_text(bytes, "Content-Length: " + HTTP.decimal(content_length) + "\r\n")
     append_text(bytes, "Connection: close\r\n\r\n")
-    try write_bytes<T>(writer, bytes)
-    return copy_exact<R, T>(input, writer, content_length)
+    try write_bytes<T>(writer, bytes, deadline)
+    return copy_exact<R, T>(input, writer, content_length, deadline)
 }
 
 package func write_response<T:IO.Writer>(
     writer:&T,
     response:@HTTP.Response,
     include_body:bool
+) Result<void, HTTP.Error> {
+    var deadline = HTTP.DeadlineBudget(null)
+    return write_response<T>(writer, response, include_body, deadline)
+}
+
+package func write_response<T:IO.Writer>(
+    writer:&T,
+    response:@HTTP.Response,
+    include_body:bool,
+    deadline:HTTP.DeadlineBudget
 ) Result<void, HTTP.Error> {
     var bytes:uint8[] = []
     var reason = response.reason()
@@ -173,13 +262,123 @@ package func write_response<T:IO.Writer>(
     if include_body && !body_forbidden(response.status()) {
         for byte in body { bytes.append(byte) }
     }
-    return write_bytes<T>(writer, bytes)
+    return write_bytes<T>(writer, bytes, deadline)
+}
+
+package func write_response_from<T:IO.Writer, R:IO.Reader>(
+    writer:&T,
+    response:@HTTP.Response,
+    input:&R,
+    content_length:int,
+    maximum_body_bytes:int,
+    include_body:bool,
+    deadline:HTTP.DeadlineBudget
+) Result<void, HTTP.Error> {
+    if content_length < 0 {
+        return Result<void, HTTP.Error>.failure(HTTP.failure(
+            HTTP.ErrorKind.body_stream, null, "streaming response content length must be non-negative"
+        ))
+    }
+    if maximum_body_bytes < 0 || content_length > maximum_body_bytes {
+        return Result<void, HTTP.Error>.failure(HTTP.failure(
+            HTTP.ErrorKind.body_limit, null, "streaming response exceeds maximum_body_bytes"
+        ))
+    }
+    let buffered_body = response.body()
+    if buffered_body.count() != 0 {
+        return Result<void, HTTP.Error>.failure(HTTP.failure(
+            HTTP.ErrorKind.body_stream, null, "streaming response must not also contain a buffered body"
+        ))
+    }
+    var bytes:uint8[] = []
+    append_text(bytes, "HTTP/1.1 " + HTTP.decimal(response.status()) + " " + response.reason() + "\r\n")
+    append_headers(bytes, response.headers())
+    var length = content_length
+    if body_forbidden(response.status()) { length = 0 }
+    append_text(bytes, "Content-Length: " + HTTP.decimal(length) + "\r\n")
+    append_text(bytes, "Connection: close\r\n\r\n")
+    try write_bytes<T>(writer, bytes, deadline)
+    if include_body && !body_forbidden(response.status()) {
+        return copy_exact<R, T>(input, writer, content_length, deadline)
+    }
+    return Result<void, HTTP.Error>.success()
+}
+
+package func write_response_chunked<T:IO.Writer, R:IO.Reader>(
+    writer:&T,
+    response:@HTTP.Response,
+    input:&R,
+    maximum_body_bytes:int,
+    include_body:bool,
+    deadline:HTTP.DeadlineBudget
+) Result<void, HTTP.Error> {
+    if maximum_body_bytes < 0 {
+        return Result<void, HTTP.Error>.failure(HTTP.failure(
+            HTTP.ErrorKind.body_limit, null, "maximum_body_bytes must be non-negative"
+        ))
+    }
+    let buffered_body = response.body()
+    if buffered_body.count() != 0 {
+        return Result<void, HTTP.Error>.failure(HTTP.failure(
+            HTTP.ErrorKind.body_stream, null, "streaming response must not also contain a buffered body"
+        ))
+    }
+    var bytes:uint8[] = []
+    append_text(bytes, "HTTP/1.1 " + HTTP.decimal(response.status()) + " " + response.reason() + "\r\n")
+    append_headers(bytes, response.headers())
+    if body_forbidden(response.status()) { append_text(bytes, "Content-Length: 0\r\n") }
+    else { append_text(bytes, "Transfer-Encoding: chunked\r\n") }
+    append_text(bytes, "Connection: close\r\n\r\n")
+    try write_bytes<T>(writer, bytes, deadline)
+    if !include_body || body_forbidden(response.status()) { return Result<void, HTTP.Error>.success() }
+    var total = 0
+    while true {
+        try deadline.check("HTTP streaming response read")
+        var buffer:uint8[256]
+        var count = 0
+        {
+            var view = &buffer[0:buffer.count()]
+            match input.read(view) {
+                success(value) => { count = value }
+                failure(error) => {
+                    return Result<void, HTTP.Error>.failure(HTTP.failure(
+                        HTTP.ErrorKind.body_stream, error.subject, error.detail
+                    ))
+                }
+            }
+        }
+        try deadline.check("HTTP streaming response read")
+        if count < 0 || count > buffer.count() {
+            return Result<void, HTTP.Error>.failure(HTTP.failure(
+                HTTP.ErrorKind.body_stream, null, "reader returned an invalid streaming response byte count"
+            ))
+        }
+        if count == 0 {
+            var ending:uint8[] = []
+            append_text(ending, "0\r\n\r\n")
+            return write_bytes<T>(writer, ending, deadline)
+        }
+        if count > maximum_body_bytes - total {
+            return Result<void, HTTP.Error>.failure(HTTP.failure(
+                HTTP.ErrorKind.body_limit, null, "chunked response exceeds maximum_body_bytes"
+            ))
+        }
+        var chunk:uint8[] = []
+        append_text(chunk, hexadecimal(count) + "\r\n")
+        var index = 0
+        while index < count { chunk.append(buffer[index]); index++ }
+        append_text(chunk, "\r\n")
+        try write_bytes<T>(writer, chunk, deadline)
+        total += count
+    }
+    panic("HTTP chunked response writer terminated unexpectedly")
 }
 
 func read_headers<T:IO.Reader>(
     reader:&T,
     limits:HTTP.Limits,
-    remaining:&int
+    remaining:&int,
+    deadline:HTTP.DeadlineBudget
 ) Result<HTTP.Headers, HTTP.Error> {
     if limits.maximum_header_bytes < 0 || limits.maximum_headers < 0 {
         return Result<HTTP.Headers, HTTP.Error>.failure(HTTP.failure(
@@ -190,7 +389,7 @@ func read_headers<T:IO.Reader>(
     }
     var headers = HTTP.Headers()
     while true {
-        let line = try read_line<T>(reader, remaining, "HTTP header")
+        let line = try read_line<T>(reader, remaining, "HTTP header", deadline)
         if line == "" { return Result<HTTP.Headers, HTTP.Error>.success(headers) }
         if headers.count() >= limits.maximum_headers {
             return Result<HTTP.Headers, HTTP.Error>.failure(HTTP.failure(
@@ -211,6 +410,17 @@ package func read_body<T:IO.Reader>(
     limits:HTTP.Limits,
     close_delimited:bool
 ) Result<uint8[], HTTP.Error> {
+    var deadline = HTTP.DeadlineBudget(null)
+    return read_body<T>(reader, headers, limits, close_delimited, deadline)
+}
+
+package func read_body<T:IO.Reader>(
+    reader:&T,
+    headers:HTTP.Headers,
+    limits:HTTP.Limits,
+    close_delimited:bool,
+    deadline:HTTP.DeadlineBudget
+) Result<uint8[], HTTP.Error> {
     if limits.maximum_body_bytes < 0 {
         return fail_bytes(HTTP.ErrorKind.body_limit, "maximum_body_bytes must be non-negative")
     }
@@ -219,10 +429,10 @@ package func read_body<T:IO.Reader>(
         if framing.length > limits.maximum_body_bytes {
             return fail_bytes(HTTP.ErrorKind.body_limit, "HTTP body exceeds maximum_body_bytes")
         }
-        return read_count<T>(reader, framing.length)
+        return read_count<T>(reader, framing.length, deadline)
     }
-    if framing.kind == 2 { return read_chunked<T>(reader, limits) }
-    if close_delimited { return read_to_end<T>(reader, limits.maximum_body_bytes) }
+    if framing.kind == 2 { return read_chunked<T>(reader, limits, deadline) }
+    if close_delimited { return read_to_end<T>(reader, limits.maximum_body_bytes, deadline) }
     return Result<uint8[], HTTP.Error>.success([])
 }
 
@@ -232,6 +442,18 @@ package func copy_body<T:IO.Reader, W:IO.Writer>(
     headers:HTTP.Headers,
     limits:HTTP.Limits,
     close_delimited:bool
+) Result<void, HTTP.Error> {
+    var deadline = HTTP.DeadlineBudget(null)
+    return copy_body<T, W>(reader, output, headers, limits, close_delimited, deadline)
+}
+
+package func copy_body<T:IO.Reader, W:IO.Writer>(
+    reader:&T,
+    output:&W,
+    headers:HTTP.Headers,
+    limits:HTTP.Limits,
+    close_delimited:bool,
+    deadline:HTTP.DeadlineBudget
 ) Result<void, HTTP.Error> {
     if limits.maximum_body_bytes < 0 {
         return Result<void, HTTP.Error>.failure(HTTP.failure(
@@ -245,10 +467,10 @@ package func copy_body<T:IO.Reader, W:IO.Writer>(
                 HTTP.ErrorKind.body_limit, null, "HTTP body exceeds maximum_body_bytes"
             ))
         }
-        return copy_exact<T, W>(reader, output, framing.length)
+        return copy_exact<T, W>(reader, output, framing.length, deadline)
     }
-    if framing.kind == 2 { return copy_chunked<T, W>(reader, output, limits) }
-    if close_delimited { return copy_to_end<T, W>(reader, output, limits.maximum_body_bytes) }
+    if framing.kind == 2 { return copy_chunked<T, W>(reader, output, limits, deadline) }
+    if close_delimited { return copy_to_end<T, W>(reader, output, limits.maximum_body_bytes, deadline) }
     return Result<void, HTTP.Error>.success()
 }
 
@@ -297,11 +519,15 @@ package func body_framing(headers:HTTP.Headers) Result<BodyFraming, HTTP.Error> 
     return Result<BodyFraming, HTTP.Error>.success(BodyFraming(kind:1, length:length))
 }
 
-func read_chunked<T:IO.Reader>(reader:&T, limits:HTTP.Limits) Result<uint8[], HTTP.Error> {
+func read_chunked<T:IO.Reader>(
+    reader:&T,
+    limits:HTTP.Limits,
+    deadline:HTTP.DeadlineBudget
+) Result<uint8[], HTTP.Error> {
     var result:uint8[] = []
     var metadata_budget = limits.maximum_header_bytes
     while true {
-        let line = try read_line<T>(reader, metadata_budget, "HTTP chunk size")
+        let line = try read_line<T>(reader, metadata_budget, "HTTP chunk size", deadline)
         let size = parse_chunk_size(line)
         if size < 0 {
             return fail_bytes(HTTP.ErrorKind.malformed_message, "HTTP chunk size is not hexadecimal")
@@ -309,7 +535,7 @@ func read_chunked<T:IO.Reader>(reader:&T, limits:HTTP.Limits) Result<uint8[], HT
         if size == 0 {
             var trailer_count = 0
             while true {
-                let trailer = try read_line<T>(reader, metadata_budget, "HTTP trailer")
+                let trailer = try read_line<T>(reader, metadata_budget, "HTTP trailer", deadline)
                 if trailer == "" { return Result<uint8[], HTTP.Error>.success(result) }
                 trailer_count++
                 if trailer_count > limits.maximum_headers {
@@ -325,9 +551,9 @@ func read_chunked<T:IO.Reader>(reader:&T, limits:HTTP.Limits) Result<uint8[], HT
         if size > limits.maximum_body_bytes - result.count() {
             return fail_bytes(HTTP.ErrorKind.body_limit, "HTTP chunked body exceeds maximum_body_bytes")
         }
-        let chunk = try read_count<T>(reader, size)
+        let chunk = try read_count<T>(reader, size, deadline)
         for byte in chunk { result.append(byte) }
-        let ending = try read_count<T>(reader, 2)
+        let ending = try read_count<T>(reader, 2, deadline)
         if ending[0] != 13 || ending[1] != 10 {
             return fail_bytes(HTTP.ErrorKind.malformed_message, "HTTP chunk is not followed by CRLF")
         }
@@ -338,12 +564,13 @@ func read_chunked<T:IO.Reader>(reader:&T, limits:HTTP.Limits) Result<uint8[], HT
 func copy_chunked<T:IO.Reader, W:IO.Writer>(
     reader:&T,
     output:&W,
-    limits:HTTP.Limits
+    limits:HTTP.Limits,
+    deadline:HTTP.DeadlineBudget
 ) Result<void, HTTP.Error> {
     var total = 0
     var metadata_budget = limits.maximum_header_bytes
     while true {
-        let line = try read_line<T>(reader, metadata_budget, "HTTP chunk size")
+        let line = try read_line<T>(reader, metadata_budget, "HTTP chunk size", deadline)
         let size = parse_chunk_size(line)
         if size < 0 {
             return Result<void, HTTP.Error>.failure(HTTP.failure(
@@ -353,7 +580,7 @@ func copy_chunked<T:IO.Reader, W:IO.Writer>(
         if size == 0 {
             var trailer_count = 0
             while true {
-                let trailer = try read_line<T>(reader, metadata_budget, "HTTP trailer")
+                let trailer = try read_line<T>(reader, metadata_budget, "HTTP trailer", deadline)
                 if trailer == "" { return Result<void, HTTP.Error>.success() }
                 trailer_count++
                 if trailer_count > limits.maximum_headers {
@@ -375,9 +602,9 @@ func copy_chunked<T:IO.Reader, W:IO.Writer>(
                 HTTP.ErrorKind.body_limit, null, "HTTP chunked body exceeds maximum_body_bytes"
             ))
         }
-        try copy_exact<T, W>(reader, output, size)
+        try copy_exact<T, W>(reader, output, size, deadline)
         total += size
-        let ending = try read_count<T>(reader, 2)
+        let ending = try read_count<T>(reader, 2, deadline)
         if ending[0] != 13 || ending[1] != 10 {
             return Result<void, HTTP.Error>.failure(HTTP.failure(
                 HTTP.ErrorKind.malformed_message, null, "HTTP chunk is not followed by CRLF"
@@ -390,14 +617,15 @@ func copy_chunked<T:IO.Reader, W:IO.Writer>(
 func copy_exact<R:IO.Reader, W:IO.Writer>(
     reader:&R,
     output:&W,
-    count:int
+    count:int,
+    deadline:HTTP.DeadlineBudget
 ) Result<void, HTTP.Error> {
     var remaining = count
     while remaining > 0 {
         var requested = remaining
         if requested > 256 { requested = 256 }
-        let bytes = try read_count<R>(reader, requested)
-        try write_stream_bytes<W>(output, bytes)
+        let bytes = try read_count<R>(reader, requested, deadline)
+        try write_stream_bytes<W>(output, bytes, deadline)
         remaining -= bytes.count()
     }
     return Result<void, HTTP.Error>.success()
@@ -406,16 +634,17 @@ func copy_exact<R:IO.Reader, W:IO.Writer>(
 func copy_to_end<R:IO.Reader, W:IO.Writer>(
     reader:&R,
     output:&W,
-    maximum:int
+    maximum:int,
+    deadline:HTTP.DeadlineBudget
 ) Result<void, HTTP.Error> {
     var total = 0
     var buffer:uint8[] = []
     while true {
-        match read_byte<R>(reader) {
+        match read_byte<R>(reader, deadline) {
             failure(error) => { return Result<void, HTTP.Error>.failure(error) }
             success(value) => {
                 if value == null {
-                    try write_stream_bytes<W>(output, buffer)
+                    try write_stream_bytes<W>(output, buffer, deadline)
                     return Result<void, HTTP.Error>.success()
                 }
                 if total >= maximum {
@@ -426,7 +655,7 @@ func copy_to_end<R:IO.Reader, W:IO.Writer>(
                 if let byte = value { buffer.append(byte) }
                 total++
                 if buffer.count() == 256 {
-                    try write_stream_bytes<W>(output, buffer)
+                    try write_stream_bytes<W>(output, buffer, deadline)
                     buffer = []
                 }
             }
@@ -435,23 +664,49 @@ func copy_to_end<R:IO.Reader, W:IO.Writer>(
     panic("HTTP body stream terminated unexpectedly")
 }
 
-func write_stream_bytes<W:IO.Writer>(output:&W, bytes:uint8[]) Result<void, HTTP.Error> {
+func write_stream_bytes<W:IO.Writer>(
+    output:&W,
+    bytes:uint8[],
+    deadline:HTTP.DeadlineBudget
+) Result<void, HTTP.Error> {
     if bytes.count() == 0 { return Result<void, HTTP.Error>.success() }
-    match IO.write_all<W>(output, @bytes[0:bytes.count()]) {
-        success => { return Result<void, HTTP.Error>.success() }
-        failure(error) => {
-            return Result<void, HTTP.Error>.failure(HTTP.failure(
-                HTTP.ErrorKind.body_stream, error.subject, error.detail
-            ))
+    var index = 0
+    while index < bytes.count() {
+        try deadline.check("HTTP body write")
+        var one:uint8[1] = [bytes[index]]
+        match output.write(@one[0:1]) {
+            success(count) => {
+                if count != 1 {
+                    return Result<void, HTTP.Error>.failure(HTTP.failure(
+                        HTTP.ErrorKind.body_stream, null, "writer did not accept one HTTP body byte"
+                    ))
+                }
+            }
+            failure(error) => {
+                return Result<void, HTTP.Error>.failure(HTTP.failure(
+                    HTTP.ErrorKind.body_stream, error.subject, error.detail
+                ))
+            }
         }
+        index++
     }
+    return Result<void, HTTP.Error>.success()
 }
 
 package func read_count<T:IO.Reader>(reader:&T, count:int) Result<uint8[], HTTP.Error> {
+    var deadline = HTTP.DeadlineBudget(null)
+    return read_count<T>(reader, count, deadline)
+}
+
+package func read_count<T:IO.Reader>(
+    reader:&T,
+    count:int,
+    deadline:HTTP.DeadlineBudget
+) Result<uint8[], HTTP.Error> {
     var result:uint8[] = []
     var index = 0
     while index < count {
-        match read_byte<T>(reader) {
+        match read_byte<T>(reader, deadline) {
             success(value) => {
                 if value == null { return fail_bytes(HTTP.ErrorKind.closed, "HTTP stream ended before the declared body length") }
                 if let byte = value { result.append(byte) }
@@ -463,10 +718,14 @@ package func read_count<T:IO.Reader>(reader:&T, count:int) Result<uint8[], HTTP.
     return Result<uint8[], HTTP.Error>.success(result)
 }
 
-func read_to_end<T:IO.Reader>(reader:&T, maximum:int) Result<uint8[], HTTP.Error> {
+func read_to_end<T:IO.Reader>(
+    reader:&T,
+    maximum:int,
+    deadline:HTTP.DeadlineBudget
+) Result<uint8[], HTTP.Error> {
     var result:uint8[] = []
     while true {
-        match read_byte<T>(reader) {
+        match read_byte<T>(reader, deadline) {
             success(value) => {
                 if value == null { return Result<uint8[], HTTP.Error>.success(result) }
                 if result.count() >= maximum {
@@ -481,6 +740,16 @@ func read_to_end<T:IO.Reader>(reader:&T, maximum:int) Result<uint8[], HTTP.Error
 }
 
 package func read_line<T:IO.Reader>(reader:&T, remaining:&int, subject:str) Result<str, HTTP.Error> {
+    var deadline = HTTP.DeadlineBudget(null)
+    return read_line<T>(reader, remaining, subject, deadline)
+}
+
+package func read_line<T:IO.Reader>(
+    reader:&T,
+    remaining:&int,
+    subject:str,
+    deadline:HTTP.DeadlineBudget
+) Result<str, HTTP.Error> {
     var bytes:uint8[] = []
     while true {
         if remaining <= 0 {
@@ -491,7 +760,7 @@ package func read_line<T:IO.Reader>(reader:&T, remaining:&int, subject:str) Resu
             ))
         }
         var next:uint8? = null
-        match read_byte<T>(reader) {
+        match read_byte<T>(reader, deadline) {
             success(value) => { next = value }
             failure(error) => { return Result<str, HTTP.Error>.failure(error) }
         }
@@ -521,7 +790,8 @@ package func read_line<T:IO.Reader>(reader:&T, remaining:&int, subject:str) Resu
     panic("HTTP line reader terminated unexpectedly")
 }
 
-func read_byte<T:IO.Reader>(reader:&T) Result<uint8?, HTTP.Error> {
+func read_byte<T:IO.Reader>(reader:&T, deadline:HTTP.DeadlineBudget) Result<uint8?, HTTP.Error> {
+    try deadline.check("HTTP read")
     var buffer:uint8[1]
     var count = 0
     {
@@ -529,10 +799,11 @@ func read_byte<T:IO.Reader>(reader:&T) Result<uint8?, HTTP.Error> {
         match reader.read(view) {
             success(value) => { count = value }
             failure(error) => {
-                return Result<uint8?, HTTP.Error>.failure(HTTP.failure(HTTP.ErrorKind.network, error.subject, error.detail))
+                return deadline_or_read_failure(deadline, error)
             }
         }
     }
+    try deadline.check("HTTP read")
     if count == 0 { return Result<uint8?, HTTP.Error>.success(null) }
     if count == 1 { return Result<uint8?, HTTP.Error>.success(buffer[0]) }
     return Result<uint8?, HTTP.Error>.failure(HTTP.failure(
@@ -542,14 +813,47 @@ func read_byte<T:IO.Reader>(reader:&T) Result<uint8?, HTTP.Error> {
     ))
 }
 
-func write_bytes<T:IO.Writer>(writer:&T, bytes:uint8[]) Result<void, HTTP.Error> {
-    if bytes.count() == 0 { return Result<void, HTTP.Error>.success() }
-    match IO.write_all<T>(writer, @bytes[0:bytes.count()]) {
-        success => { return Result<void, HTTP.Error>.success() }
-        failure(error) => {
-            return Result<void, HTTP.Error>.failure(HTTP.failure(HTTP.ErrorKind.network, error.subject, error.detail))
+func deadline_or_read_failure(
+    deadline:HTTP.DeadlineBudget,
+    error:StandardError
+) Result<uint8?, HTTP.Error> {
+    match deadline.check("HTTP read") {
+        success => {
+            return Result<uint8?, HTTP.Error>.failure(HTTP.failure(
+                HTTP.ErrorKind.network, error.subject, error.detail
+            ))
         }
+        failure(expired) => { return Result<uint8?, HTTP.Error>.failure(expired) }
     }
+}
+
+func write_bytes<T:IO.Writer>(
+    writer:&T,
+    bytes:uint8[],
+    deadline:HTTP.DeadlineBudget
+) Result<void, HTTP.Error> {
+    if bytes.count() == 0 { return Result<void, HTTP.Error>.success() }
+    var index = 0
+    while index < bytes.count() {
+        try deadline.check("HTTP write")
+        var one:uint8[1] = [bytes[index]]
+        match writer.write(@one[0:1]) {
+            success(count) => {
+                if count != 1 {
+                    return Result<void, HTTP.Error>.failure(HTTP.failure(
+                        HTTP.ErrorKind.network, null, "writer did not accept one HTTP byte"
+                    ))
+                }
+            }
+            failure(error) => {
+                return Result<void, HTTP.Error>.failure(HTTP.failure(
+                    HTTP.ErrorKind.network, error.subject, error.detail
+                ))
+            }
+        }
+        index++
+    }
+    return Result<void, HTTP.Error>.success()
 }
 
 func append_headers(bytes:&uint8[], headers:HTTP.Headers) {
@@ -662,6 +966,22 @@ package func parse_chunk_size(value:str) int {
         if digit < 0 || result > 134_217_727 { return -1 }
         result = result * 16 + digit
         index++
+    }
+    return result
+}
+
+func hexadecimal(value:int) str {
+    if value == 0 { return "0" }
+    var result = ""
+    var remaining = value
+    while remaining > 0 {
+        let digit = remaining % 16
+        var byte:uint8 = 0
+        if digit < 10 { byte = (48 + digit) as uint8 }
+        else { byte = (87 + digit) as uint8 }
+        let encoded:uint8[] = [byte]
+        result = HTTP.text_from_bytes(encoded) + result
+        remaining /= 16
     }
     return result
 }

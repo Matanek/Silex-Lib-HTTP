@@ -1,5 +1,6 @@
 use HTTP
 use HTTP.Codec
+use STD.IO
 use STD.Network
 use STD.Network.TCP
 
@@ -9,6 +10,7 @@ public struct Options {
     let accept_timeout_milliseconds:int?
     let read_timeout_milliseconds:int?
     let write_timeout_milliseconds:int?
+    let connection_timeout_milliseconds:int?
 
     func with_limits(value:HTTP.Limits) Options {
         return Options(
@@ -16,7 +18,19 @@ public struct Options {
             limits:value,
             accept_timeout_milliseconds:self.accept_timeout_milliseconds,
             read_timeout_milliseconds:self.read_timeout_milliseconds,
-            write_timeout_milliseconds:self.write_timeout_milliseconds
+            write_timeout_milliseconds:self.write_timeout_milliseconds,
+            connection_timeout_milliseconds:self.connection_timeout_milliseconds
+        )
+    }
+
+    func with_backlog(value:int) Options {
+        return Options(
+            backlog:value,
+            limits:self.limits,
+            accept_timeout_milliseconds:self.accept_timeout_milliseconds,
+            read_timeout_milliseconds:self.read_timeout_milliseconds,
+            write_timeout_milliseconds:self.write_timeout_milliseconds,
+            connection_timeout_milliseconds:self.connection_timeout_milliseconds
         )
     }
 
@@ -26,7 +40,52 @@ public struct Options {
             limits:self.limits,
             accept_timeout_milliseconds:milliseconds,
             read_timeout_milliseconds:self.read_timeout_milliseconds,
-            write_timeout_milliseconds:self.write_timeout_milliseconds
+            write_timeout_milliseconds:self.write_timeout_milliseconds,
+            connection_timeout_milliseconds:self.connection_timeout_milliseconds
+        )
+    }
+
+    func with_read_timeout(milliseconds:int?) Options {
+        return Options(
+            backlog:self.backlog,
+            limits:self.limits,
+            accept_timeout_milliseconds:self.accept_timeout_milliseconds,
+            read_timeout_milliseconds:milliseconds,
+            write_timeout_milliseconds:self.write_timeout_milliseconds,
+            connection_timeout_milliseconds:self.connection_timeout_milliseconds
+        )
+    }
+
+    func with_write_timeout(milliseconds:int?) Options {
+        return Options(
+            backlog:self.backlog,
+            limits:self.limits,
+            accept_timeout_milliseconds:self.accept_timeout_milliseconds,
+            read_timeout_milliseconds:self.read_timeout_milliseconds,
+            write_timeout_milliseconds:milliseconds,
+            connection_timeout_milliseconds:self.connection_timeout_milliseconds
+        )
+    }
+
+    func with_connection_timeout(milliseconds:int?) Options {
+        return Options(
+            backlog:self.backlog,
+            limits:self.limits,
+            accept_timeout_milliseconds:self.accept_timeout_milliseconds,
+            read_timeout_milliseconds:self.read_timeout_milliseconds,
+            write_timeout_milliseconds:self.write_timeout_milliseconds,
+            connection_timeout_milliseconds:milliseconds
+        )
+    }
+
+    func without_timeouts() Options {
+        return Options(
+            backlog:self.backlog,
+            limits:self.limits,
+            accept_timeout_milliseconds:null,
+            read_timeout_milliseconds:null,
+            write_timeout_milliseconds:null,
+            connection_timeout_milliseconds:null
         )
     }
 }
@@ -37,7 +96,8 @@ public func default_options() Options {
         limits:HTTP.default_limits(),
         accept_timeout_milliseconds:null,
         read_timeout_milliseconds:30_000,
-        write_timeout_milliseconds:30_000
+        write_timeout_milliseconds:30_000,
+        connection_timeout_milliseconds:120_000
     )
 }
 
@@ -50,8 +110,14 @@ public class IncomingBody {
     private var total:int
     private var metadata_budget:int
     private var complete:bool
+    private var deadline:HTTP.DeadlineBudget?
 
-    package init(stream:TCP.Stream, limits:HTTP.Limits, framing:Codec.BodyFraming) {
+    package init(
+        stream:TCP.Stream,
+        limits:HTTP.Limits,
+        framing:Codec.BodyFraming,
+        deadline:HTTP.DeadlineBudget
+    ) {
         self.connection = stream
         self.limits = limits
         self.framing_kind = framing.kind
@@ -60,12 +126,14 @@ public class IncomingBody {
         self.total = 0
         self.metadata_budget = limits.maximum_header_bytes
         self.complete = framing.kind == 0 || (framing.kind == 1 && framing.length == 0)
+        self.deadline = deadline
     }
 
     package static func open(
         stream:TCP.Stream,
         headers:HTTP.Headers,
-        limits:HTTP.Limits
+        limits:HTTP.Limits,
+        deadline:HTTP.DeadlineBudget
     ) Result<IncomingBody, HTTP.Error> {
         if limits.maximum_body_bytes < 0 {
             return Result<IncomingBody, HTTP.Error>.failure(HTTP.failure(
@@ -82,7 +150,7 @@ public class IncomingBody {
                 HTTP.ErrorKind.body_limit, null, "HTTP body exceeds maximum_body_bytes"
             ))
         }
-        return Result<IncomingBody, HTTP.Error>.success(IncomingBody(stream, limits, framing))
+        return Result<IncomingBody, HTTP.Error>.success(IncomingBody(stream, limits, framing, deadline))
     }
 
     func finished() bool { return self.complete }
@@ -99,7 +167,7 @@ public class IncomingBody {
                 var count = self.remaining
                 if count > maximum_bytes { count = maximum_bytes }
                 var bytes:uint8[] = []
-                match Codec.read_count<TCP.Stream>(stream, count) {
+                match Codec.read_count<TCP.Stream>(stream, count, self.deadline_value()) {
                     success(value) => { bytes = value }
                     failure(error) => { return Result<uint8[], HTTP.Error>.failure(error) }
                 }
@@ -145,7 +213,7 @@ public class IncomingBody {
         while self.chunk_remaining == 0 {
             var line = ""
             var budget = self.metadata_budget
-            match Codec.read_line<TCP.Stream>(connection, budget, "HTTP chunk size") {
+            match Codec.read_line<TCP.Stream>(connection, budget, "HTTP chunk size", self.deadline_value()) {
                 success(value) => { line = value; self.metadata_budget = budget }
                 failure(error) => { return Result<uint8[], HTTP.Error>.failure(error) }
             }
@@ -173,7 +241,7 @@ public class IncomingBody {
         var count = self.chunk_remaining
         if count > maximum_bytes { count = maximum_bytes }
         var bytes:uint8[] = []
-        match Codec.read_count<TCP.Stream>(connection, count) {
+        match Codec.read_count<TCP.Stream>(connection, count, self.deadline_value()) {
             success(value) => { bytes = value }
             failure(error) => { return Result<uint8[], HTTP.Error>.failure(error) }
         }
@@ -181,7 +249,7 @@ public class IncomingBody {
         self.total += bytes.count()
         if self.chunk_remaining == 0 {
             var ending:uint8[] = []
-            match Codec.read_count<TCP.Stream>(connection, 2) {
+            match Codec.read_count<TCP.Stream>(connection, 2, self.deadline_value()) {
                 success(value) => { ending = value }
                 failure(error) => { return Result<uint8[], HTTP.Error>.failure(error) }
             }
@@ -200,7 +268,7 @@ public class IncomingBody {
         while true {
             var line = ""
             var budget = self.metadata_budget
-            match Codec.read_line<TCP.Stream>(connection, budget, "HTTP trailer") {
+            match Codec.read_line<TCP.Stream>(connection, budget, "HTTP trailer", self.deadline_value()) {
                 success(value) => { line = value; self.metadata_budget = budget }
                 failure(error) => { return Result<void, HTTP.Error>.failure(error) }
             }
@@ -224,6 +292,108 @@ public class IncomingBody {
             }
         }
         panic("HTTP trailer reader terminated unexpectedly")
+    }
+
+    private func deadline_value() HTTP.DeadlineBudget {
+        if var value = self.deadline { return value }
+        panic("incoming HTTP body deadline is unavailable")
+    }
+}
+
+public class ResponseWriter {
+    private var connection:TCP.Stream?
+    private let include_body:bool
+    private let maximum_body_bytes:int
+    private var complete:bool
+    private var deadline:HTTP.DeadlineBudget?
+
+    package init(
+        connection:TCP.Stream,
+        include_body:bool,
+        maximum_body_bytes:int,
+        deadline:HTTP.DeadlineBudget
+    ) {
+        self.connection = connection
+        self.include_body = include_body
+        self.maximum_body_bytes = maximum_body_bytes
+        self.complete = false
+        self.deadline = deadline
+    }
+
+    func finished() bool { return self.complete }
+
+    func send(response:@HTTP.Response) Result<void, HTTP.Error> {
+        if self.complete { return self.already_finished() }
+        if var stream = self.connection {
+            match Codec.write_response<TCP.Stream>(
+                stream, response, self.include_body, self.deadline_value()
+            ) {
+                success => { self.complete = true; return Result<void, HTTP.Error>.success() }
+                failure(error) => { return Result<void, HTTP.Error>.failure(error) }
+            }
+        }
+        return self.closed()
+    }
+
+    func stream<R:IO.Reader>(
+        response:@HTTP.Response,
+        input:&R,
+        content_length:int
+    ) Result<void, HTTP.Error> {
+        if self.complete { return self.already_finished() }
+        if var stream = self.connection {
+            match Codec.write_response_from<TCP.Stream, R>(
+                stream,
+                response,
+                input,
+                content_length,
+                self.maximum_body_bytes,
+                self.include_body,
+                self.deadline_value()
+            ) {
+                success => { self.complete = true; return Result<void, HTTP.Error>.success() }
+                failure(error) => { return Result<void, HTTP.Error>.failure(error) }
+            }
+        }
+        return self.closed()
+    }
+
+    func stream_chunked<R:IO.Reader>(
+        response:@HTTP.Response,
+        input:&R
+    ) Result<void, HTTP.Error> {
+        if self.complete { return self.already_finished() }
+        if var stream = self.connection {
+            match Codec.write_response_chunked<TCP.Stream, R>(
+                stream,
+                response,
+                input,
+                self.maximum_body_bytes,
+                self.include_body,
+                self.deadline_value()
+            ) {
+                success => { self.complete = true; return Result<void, HTTP.Error>.success() }
+                failure(error) => { return Result<void, HTTP.Error>.failure(error) }
+            }
+        }
+        return self.closed()
+    }
+
+    private func deadline_value() HTTP.DeadlineBudget {
+        if var value = self.deadline { return value }
+        panic("HTTP response writer deadline is unavailable")
+    }
+
+    private func already_finished() Result<void, HTTP.Error> {
+        return Result<void, HTTP.Error>.failure(HTTP.failure(
+            HTTP.ErrorKind.body_stream, null, "HTTP response writer already sent a response"
+        ))
+    }
+
+    private func closed() Result<void, HTTP.Error> {
+        return Result<void, HTTP.Error>.failure(HTTP.failure(
+            HTTP.ErrorKind.closed, null, "HTTP response writer is closed"
+        ))
     }
 }
 
@@ -259,7 +429,7 @@ public class Listener {
     func serve_once(handler:func(@HTTP.Request) HTTP.Response) Result<void, HTTP.Error> {
         if var socket = self.socket {
             var accepted = try accept(socket, self.options)
-            var result = serve_connection(accepted.stream, accepted.peer, self.options.limits, handler)
+            var result = serve_connection(accepted.stream, accepted.peer, self.options, handler)
             close_stream(accepted.stream)
             return result
         }
@@ -281,7 +451,7 @@ public class Listener {
         while continue_serving() {
             if var socket = self.socket {
                 var accepted = try accept(socket, self.options)
-                var result = serve_connection(accepted.stream, accepted.peer, self.options.limits, handler)
+                var result = serve_connection(accepted.stream, accepted.peer, self.options, handler)
                 close_stream(accepted.stream)
                 match result {
                     success => {}
@@ -303,7 +473,7 @@ public class Listener {
     ) Result<void, HTTP.Error> {
         if var socket = self.socket {
             var accepted = try accept(socket, self.options)
-            var result = serve_stream_connection(accepted.stream, accepted.peer, self.options.limits, handler)
+            var result = serve_stream_connection(accepted.stream, accepted.peer, self.options, handler)
             close_stream(accepted.stream)
             return result
         }
@@ -325,7 +495,51 @@ public class Listener {
         while continue_serving() {
             if var socket = self.socket {
                 var accepted = try accept(socket, self.options)
-                var result = serve_stream_connection(accepted.stream, accepted.peer, self.options.limits, handler)
+                var result = serve_stream_connection(accepted.stream, accepted.peer, self.options, handler)
+                close_stream(accepted.stream)
+                match result {
+                    success => {}
+                    failure(error) => {
+                        if !connection_error(error) { return Result<void, HTTP.Error>.failure(error) }
+                    }
+                }
+            } else {
+                return Result<void, HTTP.Error>.failure(HTTP.failure(
+                    HTTP.ErrorKind.closed, null, "HTTP listener is closed"
+                ))
+            }
+        }
+        return Result<void, HTTP.Error>.success()
+    }
+
+    func serve_stream_once(
+        handler:func(@HTTP.Request, IncomingBody, ResponseWriter) Result<void, HTTP.Error>
+    ) Result<void, HTTP.Error> {
+        if var socket = self.socket {
+            var accepted = try accept(socket, self.options)
+            var result = serve_writer_connection(accepted.stream, accepted.peer, self.options, handler)
+            close_stream(accepted.stream)
+            return result
+        }
+        return Result<void, HTTP.Error>.failure(HTTP.failure(
+            HTTP.ErrorKind.closed, null, "HTTP listener is closed"
+        ))
+    }
+
+    func serve_stream(
+        handler:func(@HTTP.Request, IncomingBody, ResponseWriter) Result<void, HTTP.Error>
+    ) Result<void, HTTP.Error> {
+        return self.serve_stream_while(handler, func() bool { return true })
+    }
+
+    func serve_stream_while(
+        handler:func(@HTTP.Request, IncomingBody, ResponseWriter) Result<void, HTTP.Error>,
+        continue_serving:func() bool
+    ) Result<void, HTTP.Error> {
+        while continue_serving() {
+            if var socket = self.socket {
+                var accepted = try accept(socket, self.options)
+                var result = serve_writer_connection(accepted.stream, accepted.peer, self.options, handler)
                 close_stream(accepted.stream)
                 match result {
                     success => {}
@@ -376,6 +590,7 @@ public func listen(host:str, port:uint16) Result<Listener, HTTP.Error> {
 }
 
 public func listen(host:str, port:uint16, options:Options) Result<Listener, HTTP.Error> {
+    try validate_options(options)
     var address = Network.IpAddress.ipv4([0, 0, 0, 0])
     match Network.parse_ip(host) {
         success(value) => { address = value }
@@ -403,63 +618,116 @@ public func listen(host:str, port:uint16, options:Options) Result<Listener, HTTP
 func serve_connection(
     stream:TCP.Stream,
     peer:Network.Endpoint,
-    limits:HTTP.Limits,
+    options:Options,
     handler:func(@HTTP.Request) HTTP.Response
 ) Result<void, HTTP.Error> {
     var connection = stream
+    var deadline = HTTP.DeadlineBudget(options.connection_timeout_milliseconds)
     var request = HTTP.Request.get("/")
-    match Codec.read_request_head<TCP.Stream>(connection, limits) {
+    match Codec.read_request_head<TCP.Stream>(connection, options.limits, deadline) {
         success(value) => { request = value }
-        failure(error) => { return fail_connection(connection, error) }
+        failure(error) => { return fail_connection(connection, error, deadline) }
     }
     request.set_peer(peer)
-    var incoming = IncomingBody.open(connection, request.headers(), limits)
+    var incoming = IncomingBody.open(connection, request.headers(), options.limits, deadline)
     var body:IncomingBody? = null
     match incoming {
         success(value) => { body = value }
-        failure(error) => { return fail_connection(connection, error) }
+        failure(error) => { return fail_connection(connection, error, deadline) }
     }
     if var source = body {
         match source.read_all() {
             success(bytes) => { request.set_body(bytes) }
-            failure(error) => { return fail_connection(connection, error) }
+            failure(error) => { return fail_connection(connection, error, deadline) }
         }
     }
     var response = handler(request)
-    return Codec.write_response<TCP.Stream>(connection, response, request.method() != HTTP.Method.head)
+    return Codec.write_response<TCP.Stream>(
+        connection, response, request.method() != HTTP.Method.head, deadline
+    )
 }
 
 func serve_stream_connection(
     stream:TCP.Stream,
     peer:Network.Endpoint,
-    limits:HTTP.Limits,
+    options:Options,
     handler:func(@HTTP.Request, IncomingBody) HTTP.Response
 ) Result<void, HTTP.Error> {
     var connection = stream
+    var deadline = HTTP.DeadlineBudget(options.connection_timeout_milliseconds)
     var request = HTTP.Request.get("/")
-    match Codec.read_request_head<TCP.Stream>(connection, limits) {
+    match Codec.read_request_head<TCP.Stream>(connection, options.limits, deadline) {
         success(value) => { request = value }
-        failure(error) => { return fail_connection(connection, error) }
+        failure(error) => { return fail_connection(connection, error, deadline) }
     }
     request.set_peer(peer)
-    match IncomingBody.open(connection, request.headers(), limits) {
-        failure(error) => { return fail_connection(connection, error) }
+    match IncomingBody.open(connection, request.headers(), options.limits, deadline) {
+        failure(error) => { return fail_connection(connection, error, deadline) }
         success(body) => {
             var response = handler(request, body)
-            return Codec.write_response<TCP.Stream>(connection, response, request.method() != HTTP.Method.head)
+            return Codec.write_response<TCP.Stream>(
+                connection, response, request.method() != HTTP.Method.head, deadline
+            )
         }
     }
 }
 
+func serve_writer_connection(
+    stream:TCP.Stream,
+    peer:Network.Endpoint,
+    options:Options,
+    handler:func(@HTTP.Request, IncomingBody, ResponseWriter) Result<void, HTTP.Error>
+) Result<void, HTTP.Error> {
+    var connection = stream
+    var deadline = HTTP.DeadlineBudget(options.connection_timeout_milliseconds)
+    var request = HTTP.Request.get("/")
+    match Codec.read_request_head<TCP.Stream>(connection, options.limits, deadline) {
+        success(value) => { request = value }
+        failure(error) => { return fail_connection(connection, error, deadline) }
+    }
+    request.set_peer(peer)
+    var body:IncomingBody? = null
+    match IncomingBody.open(connection, request.headers(), options.limits, deadline) {
+        success(value) => { body = value }
+        failure(error) => { return fail_connection(connection, error, deadline) }
+    }
+    if var incoming = body {
+        var writer = ResponseWriter(
+            connection,
+            request.method() != HTTP.Method.head,
+            options.limits.maximum_body_bytes,
+            deadline
+        )
+        match handler(request, incoming, writer) {
+            failure(error) => {
+                if writer.finished() { return Result<void, HTTP.Error>.failure(error) }
+                return fail_connection(connection, error, deadline)
+            }
+            success => {
+                if writer.finished() { return Result<void, HTTP.Error>.success() }
+                return fail_connection(connection, HTTP.failure(
+                    HTTP.ErrorKind.invalid_response,
+                    null,
+                    "HTTP streaming handler returned without sending a response"
+                ), deadline)
+            }
+        }
+    }
+    return Result<void, HTTP.Error>.failure(HTTP.failure(
+        HTTP.ErrorKind.closed, null, "HTTP incoming body was unavailable"
+    ))
+}
+
 func fail_connection(
     stream:TCP.Stream,
-    error:HTTP.Error
+    error:HTTP.Error,
+    deadline:HTTP.DeadlineBudget
 ) Result<void, HTTP.Error> {
     var connection = stream
     let status = protocol_status(error.kind)
     if status > 0 {
         var response = HTTP.Response.text(status, error.detail)
-        match Codec.write_response<TCP.Stream>(connection, response, true) {
+        match Codec.write_response<TCP.Stream>(connection, response, true, deadline) {
             success => {}
             failure(write_error) => { return Result<void, HTTP.Error>.failure(write_error) }
         }
@@ -469,6 +737,8 @@ func fail_connection(
 
 func protocol_status(kind:HTTP.ErrorKind) int {
     if kind == HTTP.ErrorKind.malformed_message || kind == HTTP.ErrorKind.invalid_text { return 400 }
+    if kind == HTTP.ErrorKind.invalid_response { return 500 }
+    if kind == HTTP.ErrorKind.deadline_exceeded { return 408 }
     if kind == HTTP.ErrorKind.header_limit { return 431 }
     if kind == HTTP.ErrorKind.body_limit { return 413 }
     if kind == HTTP.ErrorKind.unsupported_transfer || kind == HTTP.ErrorKind.unsupported_upgrade { return 501 }
@@ -480,7 +750,45 @@ func connection_error(error:HTTP.Error) bool {
         error.kind == HTTP.ErrorKind.body_limit || error.kind == HTTP.ErrorKind.unsupported_transfer ||
         error.kind == HTTP.ErrorKind.unsupported_upgrade || error.kind == HTTP.ErrorKind.invalid_text ||
         error.kind == HTTP.ErrorKind.closed || error.kind == HTTP.ErrorKind.network ||
-        error.kind == HTTP.ErrorKind.body_stream
+        error.kind == HTTP.ErrorKind.body_stream || error.kind == HTTP.ErrorKind.deadline_exceeded
+}
+
+func validate_options(options:Options) Result<void, HTTP.Error> {
+    if options.backlog <= 0 {
+        return Result<void, HTTP.Error>.failure(HTTP.failure(
+            HTTP.ErrorKind.invalid_configuration, null, "HTTP server backlog must be positive"
+        ))
+    }
+    if negative_timeout(options.accept_timeout_milliseconds) ||
+        negative_timeout(options.read_timeout_milliseconds) ||
+        negative_timeout(options.write_timeout_milliseconds) ||
+        negative_timeout(options.connection_timeout_milliseconds) {
+        return Result<void, HTTP.Error>.failure(HTTP.failure(
+            HTTP.ErrorKind.invalid_configuration, null, "HTTP server timeouts must be non-negative"
+        ))
+    }
+    if options.limits.maximum_header_bytes < 0 || options.limits.maximum_headers < 0 ||
+        options.limits.maximum_body_bytes < 0 || options.limits.maximum_informational_responses < 0 {
+        return Result<void, HTTP.Error>.failure(HTTP.failure(
+            HTTP.ErrorKind.invalid_configuration, null, "HTTP server limits must be non-negative"
+        ))
+    }
+    return Result<void, HTTP.Error>.success()
+}
+
+func negative_timeout(value:int?) bool {
+    if let milliseconds = value { return milliseconds < 0 }
+    return false
+}
+
+func bounded_stream_timeout(configured:int?, total:int?) int? {
+    if let maximum = total {
+        if let value = configured {
+            if value < maximum { return value }
+        }
+        return maximum
+    }
+    return configured
 }
 
 func accept(socket:&TCP.Listener, options:Options) Result<TCP.Accepted, HTTP.Error> {
@@ -488,8 +796,12 @@ func accept(socket:&TCP.Listener, options:Options) Result<TCP.Accepted, HTTP.Err
         socket,
         options.accept_timeout_milliseconds,
         TCP.StreamOptions(
-            read_timeout_milliseconds:options.read_timeout_milliseconds,
-            write_timeout_milliseconds:options.write_timeout_milliseconds
+            read_timeout_milliseconds:bounded_stream_timeout(
+                options.read_timeout_milliseconds, options.connection_timeout_milliseconds
+            ),
+            write_timeout_milliseconds:bounded_stream_timeout(
+                options.write_timeout_milliseconds, options.connection_timeout_milliseconds
+            )
         )
     ) {
         success(value) => { return Result<TCP.Accepted, HTTP.Error>.success(value) }

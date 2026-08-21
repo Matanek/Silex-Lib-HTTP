@@ -1,5 +1,6 @@
 use STD.Text.UTF8
 use STD.Network
+use STD.Time.Stopwatch
 
 public enum Method {
     get
@@ -26,9 +27,15 @@ public struct QueryParameter {
 
 public enum ErrorKind {
     invalid_url
+    invalid_header
+    invalid_request
+    invalid_response
+    invalid_configuration
     unsupported_scheme
     network
     secure_transport
+    deadline_exceeded
+    network_policy
     malformed_message
     header_limit
     body_limit
@@ -46,6 +53,60 @@ public struct Error {
     let kind:ErrorKind
     let subject:str?
     let detail:str
+}
+
+package class DeadlineBudget {
+    private let maximum_milliseconds:int?
+    private var elapsed:Stopwatch
+
+    init(maximum_milliseconds:int?) {
+        self.maximum_milliseconds = maximum_milliseconds
+        self.elapsed = Stopwatch()
+        self.elapsed.start()
+    }
+
+    func check(subject:str) Result<void, Error> {
+        if let maximum = self.maximum_milliseconds {
+            if maximum < 0 {
+                return Result<void, Error>.failure(failure(
+                    ErrorKind.invalid_configuration, subject, "HTTP timeout must be non-negative"
+                ))
+            }
+            if self.elapsed.get_elapsed_milliseconds() >= maximum as float {
+                return Result<void, Error>.failure(failure(
+                    ErrorKind.deadline_exceeded, subject, "HTTP total deadline exceeded"
+                ))
+            }
+        }
+        return Result<void, Error>.success()
+    }
+
+    func bounded_timeout(configured:int?, subject:str) Result<int?, Error> {
+        match self.check(subject) {
+            success => {}
+            failure(error) => { return Result<int?, Error>.failure(error) }
+        }
+        if let maximum = self.maximum_milliseconds {
+            var remaining = maximum
+            if let value = configured {
+                if value < 0 {
+                    return Result<int?, Error>.failure(failure(
+                        ErrorKind.invalid_configuration, subject, "HTTP timeout must be non-negative"
+                    ))
+                }
+                if value < remaining { remaining = value }
+            }
+            return Result<int?, Error>.success(remaining)
+        }
+        if let value = configured {
+            if value < 0 {
+                return Result<int?, Error>.failure(failure(
+                    ErrorKind.invalid_configuration, subject, "HTTP timeout must be non-negative"
+                ))
+            }
+        }
+        return Result<int?, Error>.success(configured)
+    }
 }
 
 public struct Limits {
@@ -107,14 +168,36 @@ public class Headers {
     func contains(name:str) bool { return self.get(name) != null }
 
     func append(name:str, value:str) {
-        require_header(name, value)
+        match self.try_append(name, value) {
+            success => {}
+            failure(error) => { panic(error.detail) }
+        }
+    }
+
+    func try_append(name:str, value:str) Result<void, Error> {
+        match validate_header(name, value) {
+            success => {}
+            failure(error) => { return Result<void, Error>.failure(error) }
+        }
         self.entries.append(Header(name:name, value:value))
+        return Result<void, Error>.success()
     }
 
     func set(name:str, value:str) {
-        require_header(name, value)
+        match self.try_set(name, value) {
+            success => {}
+            failure(error) => { panic(error.detail) }
+        }
+    }
+
+    func try_set(name:str, value:str) Result<void, Error> {
+        match validate_header(name, value) {
+            success => {}
+            failure(error) => { return Result<void, Error>.failure(error) }
+        }
         self.remove(name)
         self.entries.append(Header(name:name, value:value))
+        return Result<void, Error>.success()
     }
 
     func remove(name:str) int {
@@ -147,6 +230,24 @@ public class Request {
         self.request_headers = Headers()
         self.request_body = []
         self.request_peer = null
+    }
+
+    static func try_new(method:Method, target:str) Result<Request, Error> {
+        if !valid_method_text(method_text(method)) {
+            return Result<Request, Error>.failure(failure(
+                ErrorKind.invalid_request,
+                method_text(method),
+                "HTTP request method contains an invalid byte"
+            ))
+        }
+        if !valid_request_target(target) {
+            return Result<Request, Error>.failure(failure(
+                ErrorKind.invalid_request,
+                target,
+                "HTTP request target contains an invalid byte"
+            ))
+        }
+        return Result<Request, Error>.success(Request(method, target))
     }
 
     static func get(target:str) Request { return Request(Method.get, target) }
@@ -194,6 +295,24 @@ public class Response {
         self.response_reason = reason
         self.response_headers = Headers()
         self.response_body = []
+    }
+
+    static func try_new(status:int, reason:str = "") Result<Response, Error> {
+        if status < 100 || status > 999 {
+            return Result<Response, Error>.failure(failure(
+                ErrorKind.invalid_response,
+                decimal(status),
+                "HTTP response status must have three digits"
+            ))
+        }
+        if !valid_reason(reason) {
+            return Result<Response, Error>.failure(failure(
+                ErrorKind.invalid_response,
+                reason,
+                "HTTP response reason contains a forbidden control byte"
+            ))
+        }
+        return Result<Response, Error>.success(Response(status, reason))
     }
 
     static func text(
@@ -640,17 +759,28 @@ func parse_port(value:str, subject:str) Result<uint16, Error> {
     return Result<uint16, Error>.success(number as uint16)
 }
 
-func require_header(name:str, value:str) {
+func validate_header(name:str, value:str) Result<void, Error> {
     let name_bytes = UTF8.bytes(name)
-    if name_bytes.count() == 0 { panic("HTTP header name cannot be empty") }
+    if name_bytes.count() == 0 {
+        return Result<void, Error>.failure(failure(
+            ErrorKind.invalid_header, name, "HTTP header name cannot be empty"
+        ))
+    }
     for byte in name_bytes {
-        if !header_name_byte(byte) { panic("invalid HTTP header name '$(name)'") }
+        if !header_name_byte(byte) {
+            return Result<void, Error>.failure(failure(
+                ErrorKind.invalid_header, name, "HTTP header name contains an invalid byte"
+            ))
+        }
     }
     for byte in UTF8.bytes(value) {
         if (byte < 32 && byte != 9) || byte == 127 {
-            panic("HTTP header value contains a forbidden control character")
+            return Result<void, Error>.failure(failure(
+                ErrorKind.invalid_header, name, "HTTP header value contains a forbidden control character"
+            ))
         }
     }
+    return Result<void, Error>.success()
 }
 
 package func valid_method_text(value:str) bool {
@@ -740,6 +870,7 @@ func reason_phrase(status:int) str {
     if status == 400 { return "Bad Request" }
     if status == 404 { return "Not Found" }
     if status == 405 { return "Method Not Allowed" }
+    if status == 408 { return "Request Timeout" }
     if status == 413 { return "Content Too Large" }
     if status == 431 { return "Request Header Fields Too Large" }
     if status == 500 { return "Internal Server Error" }

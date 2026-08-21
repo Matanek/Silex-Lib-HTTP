@@ -1,11 +1,11 @@
 {
   "name": "HTTP",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "requires": {
     "silex": ">=0.38.37"
   },
   "dependencies": {
-    "STD": "^0.16.8"
+    "STD": "^0.16.9"
   },
   "devDependencies": {
     "HTML": "^0.3.0",

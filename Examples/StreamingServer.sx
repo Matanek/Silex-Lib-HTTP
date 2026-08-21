@@ -1,0 +1,124 @@
+use HTTP
+use HTTP.Server
+use STD.Error
+use STD.IO
+use STD.Network
+use STD.Process
+use STD.Text.UTF8
+use STD.Time.Stopwatch
+
+class TextReader:IO.Reader {
+    private let bytes:uint8[]
+    private var cursor:int
+
+    init(text:str) {
+        self.bytes = UTF8.bytes(text)
+        self.cursor = 0
+    }
+
+    func read(buffer:&uint8[..]) Result<int, Error> {
+        var count = 0
+        while count < buffer.count() && self.cursor < self.bytes.count() {
+            buffer[count] = self.bytes[self.cursor]
+            count++
+            self.cursor++
+        }
+        return Result<int, Error>.success(count)
+    }
+}
+
+class SlowReader:IO.Reader {
+    private var sent:bool
+
+    init() { self.sent = false }
+
+    func read(buffer:&uint8[..]) Result<int, Error> {
+        if self.sent { return Result<int, Error>.success(0) }
+        var elapsed = Stopwatch()
+        elapsed.start()
+        while elapsed.get_elapsed_milliseconds() < 100.0 {}
+        let bytes = UTF8.bytes("slow")
+        var count = 0
+        while count < buffer.count() && count < bytes.count() {
+            buffer[count] = bytes[count]
+            count++
+        }
+        self.sent = true
+        return Result<int, Error>.success(count)
+    }
+}
+
+func handle(
+    request:@HTTP.Request,
+    body:Server.IncomingBody,
+    response:Server.ResponseWriter
+) Result<void, HTTP.Error> {
+    try body.discard()
+    if request.path() == "/redirect" {
+        var redirect = HTTP.Response(302, "Found")
+        redirect.headers().set("Location", "/chunked")
+        return response.send(redirect)
+    }
+    if request.path() == "/known" {
+        var source = TextReader("known stream")
+        var head = HTTP.Response(200, "OK")
+        head.headers().set("Content-Type", "text/plain; charset=utf-8")
+        return response.stream<TextReader>(head, source, 12)
+    }
+    if request.path() == "/chunked" {
+        var source = TextReader("chunked stream")
+        var head = HTTP.Response(200, "OK")
+        head.headers().set("Content-Type", "text/plain; charset=utf-8")
+        return response.stream_chunked<TextReader>(head, source)
+    }
+    if request.path() == "/cutoff" {
+        var source = TextReader("cut")
+        var head = HTTP.Response(200, "OK")
+        return response.stream<TextReader>(head, source, 8)
+    }
+    if request.path() == "/slow" {
+        var source = SlowReader()
+        var head = HTTP.Response(200, "OK")
+        return response.stream_chunked<SlowReader>(head, source)
+    }
+    return response.send(HTTP.Response.text(404, "Not found"))
+}
+
+func run(port:uint16) Result<void, HTTP.Error> {
+    var server = try Server.listen(
+        "127.0.0.1",
+        port,
+        Server.default_options().with_connection_timeout(5_000)
+    )
+    let endpoint = try server.local_endpoint()
+    print("Listening on http://$(Network.format_endpoint(endpoint))")
+    return server.serve_stream(handle)
+}
+
+func selected_port() uint16 {
+    match Process.arguments() {
+        success(arguments) => {
+            if arguments.count() > 1 { return parse_port(arguments[1]) }
+        }
+        failure(error) => { panic(error.detail) }
+    }
+    return 18082
+}
+
+func parse_port(text:str) uint16 {
+    var value = 0
+    for byte in UTF8.bytes(text) {
+        if byte < 48 || byte > 57 { panic("streaming server port must be numeric") }
+        value = value * 10 + (byte - 48) as int
+        if value > 65_535 { panic("streaming server port exceeds uint16") }
+    }
+    if value <= 0 { panic("streaming server port must be positive") }
+    return value as uint16
+}
+
+func main() {
+    match run(selected_port()) {
+        success => {}
+        failure(error) => { panic(error.detail) }
+    }
+}
