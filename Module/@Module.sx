@@ -133,6 +133,8 @@ public struct Url {
         return name + ":" + decimal(self.port as int)
     }
 
+    func text() str { return self.scheme + "://" + self.authority() + self.target }
+
     func path() str { return target_path(self.target) }
     func query() str? { return target_query(self.target) }
     func query_parameters() Result<QueryParameter[], Error> { return parse_query(self.target) }

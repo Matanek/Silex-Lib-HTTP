@@ -79,6 +79,16 @@ func require_text(result:Result<str, HTTP.Error>) str {
     return output
 }
 
+func require_session(result:Result<Client.Session, HTTP.Error>) Client.Session {
+    var output:Client.Session? = null
+    match result {
+        success(value) => { output = value }
+        failure(error) => { panic(error.detail) }
+    }
+    if var session = output { return session }
+    panic("client session should be available")
+}
+
 test "parse URL authority target and fragment" {
     match HTTP.Url.parse("http://127.0.0.1:8080/docs?q=silex#section") {
         failure(error) => { panic(error.detail) }
@@ -365,6 +375,43 @@ test "configure client and server time budgets fluently" {
     else { panic("server write timeout should be configured") }
     if let value = server.connection_timeout_milliseconds { assert(value == 3_000) }
     else { panic("connection timeout should be configured") }
+}
+
+test "configure an explicitly owned client session" {
+    let options = Client.default_options().with_maximum_idle_connections_per_origin(2)
+    assert(options.maximum_idle_connections_per_origin == 2)
+    var session = require_session(Client.Session.create(options))
+    assert(!session.is_closed())
+    assert(session.idle_connection_count() == 0)
+    match session.set_default_header("Accept", "application/json") {
+        success => {}
+        failure(error) => { panic(error.detail) }
+    }
+    match session.set_default_header("Bad Header", "value") {
+        success => { panic("invalid session default header should fail") }
+        failure(error) => { assert(error.kind == HTTP.ErrorKind.invalid_header) }
+    }
+    match session.authenticate_bearer("") {
+        success => { panic("empty bearer token should fail") }
+        failure(error) => { assert(error.kind == HTTP.ErrorKind.invalid_configuration) }
+    }
+    session.enable_cookies()
+    assert(session.cookies_enabled())
+    match session.close() {
+        success => {}
+        failure(error) => { panic(error.detail) }
+    }
+    assert(session.is_closed())
+    match session.close() {
+        success => {}
+        failure(error) => { panic("session close should be idempotent") }
+    }
+    match Client.Session.create(
+        Client.default_options().with_maximum_idle_connections_per_origin(-1)
+    ) {
+        success(invalid) => { panic("negative pool size should fail") }
+        failure(error) => { assert(error.kind == HTTP.ErrorKind.invalid_configuration) }
+    }
 }
 
 test "reject non-public resolved endpoints with the optional client policy" {

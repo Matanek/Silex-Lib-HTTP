@@ -34,6 +34,51 @@ Untrusted values do not need to cross a panic boundary. `Headers.try_append`,
 `HTTP.Error`. The original constructors and mutators remain available as strict
 conveniences for literals and application-owned constants.
 
+## Reusable client sessions
+
+`Client.Session` explicitly owns shared configuration and persistent
+connections. Idle connections are pooled by scheme, host and port, then reused
+with HTTP/1.1 keep-alive until either peer requests `Connection: close`.
+
+```sx
+var session = try Client.Session.create(
+    Client.default_options().with_maximum_idle_connections_per_origin(4)
+)
+try session.set_default_header("Accept", "application/json")
+try session.authenticate_bearer(token)
+session.enable_cookies()
+
+var exchange = try session.get("https://example.com/api")
+print(exchange.final_url.text())
+print(exchange.redirects.count())
+
+try session.close()
+```
+
+`get`, `head`, `delete`, `post`, `put`, `patch`, `send`, `download`,
+`send_stream`, `open` and `open_request` are available on a session. Buffered
+operations return an `Exchange` containing the response, final URL and ordered
+`RedirectHop` history. The original module functions keep returning
+`HTTP.Response` or `IncomingResponse` and delegate to a temporary session for
+source compatibility.
+
+Default headers never replace request-specific headers. `authenticate_basic`,
+`authenticate_bearer` and `clear_authentication` manage the shared
+`Authorization` header. Sensitive defaults are not reapplied after a
+cross-origin redirect.
+
+Cookies are disabled by default. `enable_cookies()` activates a conservative,
+in-memory, host-scoped session jar with `Path`, `Secure` and `Max-Age=0`
+handling. It is cleared with the session and does not claim persistent browser
+cookie storage or public-suffix/domain-cookie behavior.
+
+An `IncomingResponse` returns its connection to the owning session only after
+the body is fully read, copied or discarded. Closing or dropping an unfinished
+response closes that connection instead, preventing unread bytes from
+poisoning the next request. `Session.close()` is explicit and idempotent; a
+late progressive response can finish safely but its connection will then be
+closed rather than repooled.
+
 ## Time budgets and network policy
 
 Client options expose fluent connect, read, write and total timeouts. The total
@@ -57,6 +102,8 @@ for certificate verification.
 The bootstrap socket backend still reports a structured unsupported network
 error when a non-null connect timeout is requested; it is never silently
 ignored. Read/write socket timeouts and HTTP total deadlines are enforced.
+Persistent sessions reduce repeated connection attempts but do not remove this
+limitation from the first connection to an origin.
 
 ## URLs and query parameters
 
@@ -94,7 +141,9 @@ try server.serve(handle)
 `serve_once` exposes the error from one controlled connection. Long-running
 `serve` loops isolate malformed, prematurely closed and oversized connections;
 when possible they send `400`, `413`, `431` or `501` and continue accepting.
-`Request.peer()` exposes the accepted peer endpoint.
+They serve successive HTTP/1.1 requests on a persistent connection until a peer
+requests closure or a connection deadline expires. `Request.peer()` exposes
+the accepted peer endpoint.
 
 `serve_while` checks an application predicate between connections and returns
 successfully when it becomes false. It does not interrupt an accept already in
@@ -117,8 +166,8 @@ be seekable.
 
 `Client.open` and `Client.open_request` instead return a client-owned
 `IncomingResponse`. Inspect its status and headers, then call `read`, `read_all`,
-`copy_to` or `discard` progressively. Call `close` when finished; dropping the
-value also closes its TCP or TLS connection.
+`copy_to` or `discard` progressively. A session-owned response returns a clean,
+fully consumed connection to its pool; otherwise `close` or `drop` closes it.
 
 For streamed server output, use the three-argument `serve_stream` handler. Its
 `ResponseWriter` can `send` a buffered response, `stream` a reader with a known
@@ -130,8 +179,9 @@ handler. A writer accepts exactly one response. Fixed and chunked output both
 obey the configured body limit and connection deadline.
 
 See `Examples/AdvancedServer.sx`, `Examples/AdvancedClient.sx`,
-`Examples/StreamingServer.sx` and `Examples/StreamingClient.sx` for complete
-buffered and progressive flows.
+`Examples/SessionClient.sx`, `Examples/StreamingServer.sx` and
+`Examples/StreamingClient.sx` for complete buffered, reusable and progressive
+flows.
 
 ## Protocol guarantees and limits
 
@@ -142,9 +192,10 @@ exactly one non-empty `Host` header on HTTP/1.1 requests and rejects conflicting
 framing, forbidden trailer fields, invalid field names, bare-LF lines, protocol
 upgrades and unsupported transfer codings.
 
-Outgoing messages currently use `Content-Length` and `Connection: close`.
-Connection pooling, automatic content decompression and cookie persistence are
-not implicit in version 0.2.
+Outgoing buffered messages use `Content-Length`; streamed responses may use
+chunked transfer coding. Sessions use keep-alive while one-shot operations
+close their temporary pool after completion. Automatic content decompression
+and persistent cookie storage are not implicit in version 0.4.
 
 `Request.set_text`, `Response.text` and their `text()` projections use UTF-8.
 Raw byte bodies remain available for other media types.
@@ -167,6 +218,7 @@ silex run Packages/HTTP/Examples/Server.sx
 silex run Packages/HTTP/Examples/Client.sx
 silex run Packages/HTTP/Examples/AdvancedServer.sx
 silex run Packages/HTTP/Examples/AdvancedClient.sx
+silex run Packages/HTTP/Examples/SessionClient.sx
 silex run Packages/HTTP/Examples/StreamingServer.sx
 silex run Packages/HTTP/Examples/StreamingClient.sx
 Packages/HTTP/Tests/run-network-tests.sh

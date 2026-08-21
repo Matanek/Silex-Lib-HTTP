@@ -5,6 +5,7 @@ use STD.IO
 use STD.Network
 use STD.Network.TCP
 use STD.Network.TLS
+use STD.Text.UTF8
 
 public enum AddressPolicy {
     unrestricted
@@ -18,6 +19,7 @@ public struct Options {
     let write_timeout_milliseconds:int?
     let total_timeout_milliseconds:int?
     let maximum_redirects:int
+    let maximum_idle_connections_per_origin:int
     let allow_insecure_redirects:bool
     let address_policy:AddressPolicy
 
@@ -29,6 +31,7 @@ public struct Options {
             write_timeout_milliseconds:self.write_timeout_milliseconds,
             total_timeout_milliseconds:self.total_timeout_milliseconds,
             maximum_redirects:self.maximum_redirects,
+            maximum_idle_connections_per_origin:self.maximum_idle_connections_per_origin,
             allow_insecure_redirects:self.allow_insecure_redirects,
             address_policy:self.address_policy
         )
@@ -42,6 +45,7 @@ public struct Options {
             write_timeout_milliseconds:self.write_timeout_milliseconds,
             total_timeout_milliseconds:self.total_timeout_milliseconds,
             maximum_redirects:self.maximum_redirects,
+            maximum_idle_connections_per_origin:self.maximum_idle_connections_per_origin,
             allow_insecure_redirects:self.allow_insecure_redirects,
             address_policy:self.address_policy
         )
@@ -55,6 +59,7 @@ public struct Options {
             write_timeout_milliseconds:self.write_timeout_milliseconds,
             total_timeout_milliseconds:self.total_timeout_milliseconds,
             maximum_redirects:self.maximum_redirects,
+            maximum_idle_connections_per_origin:self.maximum_idle_connections_per_origin,
             allow_insecure_redirects:self.allow_insecure_redirects,
             address_policy:self.address_policy
         )
@@ -68,6 +73,7 @@ public struct Options {
             write_timeout_milliseconds:milliseconds,
             total_timeout_milliseconds:self.total_timeout_milliseconds,
             maximum_redirects:self.maximum_redirects,
+            maximum_idle_connections_per_origin:self.maximum_idle_connections_per_origin,
             allow_insecure_redirects:self.allow_insecure_redirects,
             address_policy:self.address_policy
         )
@@ -81,6 +87,7 @@ public struct Options {
             write_timeout_milliseconds:self.write_timeout_milliseconds,
             total_timeout_milliseconds:milliseconds,
             maximum_redirects:self.maximum_redirects,
+            maximum_idle_connections_per_origin:self.maximum_idle_connections_per_origin,
             allow_insecure_redirects:self.allow_insecure_redirects,
             address_policy:self.address_policy
         )
@@ -94,6 +101,7 @@ public struct Options {
             write_timeout_milliseconds:self.write_timeout_milliseconds,
             total_timeout_milliseconds:self.total_timeout_milliseconds,
             maximum_redirects:maximum,
+            maximum_idle_connections_per_origin:self.maximum_idle_connections_per_origin,
             allow_insecure_redirects:self.allow_insecure_redirects,
             address_policy:self.address_policy
         )
@@ -107,6 +115,7 @@ public struct Options {
             write_timeout_milliseconds:self.write_timeout_milliseconds,
             total_timeout_milliseconds:self.total_timeout_milliseconds,
             maximum_redirects:self.maximum_redirects,
+            maximum_idle_connections_per_origin:self.maximum_idle_connections_per_origin,
             allow_insecure_redirects:allowed,
             address_policy:self.address_policy
         )
@@ -120,6 +129,7 @@ public struct Options {
             write_timeout_milliseconds:self.write_timeout_milliseconds,
             total_timeout_milliseconds:self.total_timeout_milliseconds,
             maximum_redirects:self.maximum_redirects,
+            maximum_idle_connections_per_origin:self.maximum_idle_connections_per_origin,
             allow_insecure_redirects:self.allow_insecure_redirects,
             address_policy:policy
         )
@@ -131,6 +141,20 @@ public struct Options {
         return self.with_address_policy(policy)
     }
 
+    func with_maximum_idle_connections_per_origin(maximum:int) Options {
+        return Options(
+            limits:self.limits,
+            connect_timeout_milliseconds:self.connect_timeout_milliseconds,
+            read_timeout_milliseconds:self.read_timeout_milliseconds,
+            write_timeout_milliseconds:self.write_timeout_milliseconds,
+            total_timeout_milliseconds:self.total_timeout_milliseconds,
+            maximum_redirects:self.maximum_redirects,
+            maximum_idle_connections_per_origin:maximum,
+            allow_insecure_redirects:self.allow_insecure_redirects,
+            address_policy:self.address_policy
+        )
+    }
+
     func without_timeouts() Options {
         return Options(
             limits:self.limits,
@@ -139,6 +163,7 @@ public struct Options {
             write_timeout_milliseconds:null,
             total_timeout_milliseconds:null,
             maximum_redirects:self.maximum_redirects,
+            maximum_idle_connections_per_origin:self.maximum_idle_connections_per_origin,
             allow_insecure_redirects:self.allow_insecure_redirects,
             address_policy:self.address_policy
         )
@@ -153,6 +178,7 @@ public func default_options() Options {
         write_timeout_milliseconds:30_000,
         total_timeout_milliseconds:120_000,
         maximum_redirects:10,
+        maximum_idle_connections_per_origin:4,
         allow_insecure_redirects:false,
         address_policy:AddressPolicy.unrestricted
     )
@@ -215,6 +241,27 @@ package class Connection:IO.Reader, IO.Writer {
     drop { match self.close() { success => {}; failure(error) => {} } }
 }
 
+public struct RedirectHop {
+    let url:HTTP.Url
+    let status:int
+    let location:str
+    let next_url:HTTP.Url
+}
+
+public struct Exchange {
+    var response:HTTP.Response
+    let final_url:HTTP.Url
+    let redirects:RedirectHop[]
+}
+
+package struct IncomingContext {
+    var owner:Session?
+    let origin:str
+    let reusable:bool
+    let resolved_url:HTTP.Url
+    let redirects:RedirectHop[]
+}
+
 public class IncomingResponse {
     private var metadata:HTTP.Response?
     private var connection:Connection?
@@ -226,6 +273,11 @@ public class IncomingResponse {
     private var metadata_budget:int
     private var complete:bool
     private var deadline:HTTP.DeadlineBudget?
+    private var owner:Session?
+    private let origin:str
+    private let reusable:bool
+    private let resolved_url:HTTP.Url
+    private let redirect_hops:RedirectHop[]
 
     package init(
         metadata:HTTP.Response,
@@ -233,7 +285,8 @@ public class IncomingResponse {
         limits:HTTP.Limits,
         framing:Codec.BodyFraming,
         expect_body:bool,
-        deadline:HTTP.DeadlineBudget
+        deadline:HTTP.DeadlineBudget,
+        context:IncomingContext
     ) {
         self.metadata = metadata
         self.connection = connection
@@ -245,6 +298,11 @@ public class IncomingResponse {
         self.metadata_budget = limits.maximum_header_bytes
         self.complete = !expect_body || framing.kind == 1 && framing.length == 0
         self.deadline = deadline
+        self.owner = context.owner
+        self.origin = context.origin
+        self.reusable = context.reusable && (!expect_body || framing.kind != 0)
+        self.resolved_url = context.resolved_url
+        self.redirect_hops = context.redirects
     }
 
     package static func start(
@@ -253,6 +311,30 @@ public class IncomingResponse {
         limits:HTTP.Limits,
         expect_body:bool,
         deadline:HTTP.DeadlineBudget
+    ) Result<IncomingResponse, HTTP.Error> {
+        return IncomingResponse.start(
+            metadata,
+            connection,
+            limits,
+            expect_body,
+            deadline,
+            IncomingContext(
+                owner:null,
+                origin:"",
+                reusable:false,
+                resolved_url:empty_url(),
+                redirects:[]
+            )
+        )
+    }
+
+    package static func start(
+        metadata:HTTP.Response,
+        connection:Connection,
+        limits:HTTP.Limits,
+        expect_body:bool,
+        deadline:HTTP.DeadlineBudget,
+        context:IncomingContext
     ) Result<IncomingResponse, HTTP.Error> {
         var framing = Codec.BodyFraming(kind:0, length:0)
         match Codec.body_framing(metadata.headers()) {
@@ -264,15 +346,25 @@ public class IncomingResponse {
                 HTTP.ErrorKind.body_limit, null, "HTTP body exceeds maximum_body_bytes"
             ))
         }
-        return Result<IncomingResponse, HTTP.Error>.success(IncomingResponse(
-            metadata, connection, limits, framing, expect_body, deadline
-        ))
+        var result = IncomingResponse(
+            metadata,
+            connection,
+            limits,
+            framing,
+            expect_body,
+            deadline,
+            context
+        )
+        if result.complete { result.finish_connection() }
+        return Result<IncomingResponse, HTTP.Error>.success(result)
     }
 
     func response() HTTP.Response { return self.metadata_value() }
     func status() int { return self.metadata_value().status() }
     func headers() HTTP.Headers { return self.metadata_value().headers() }
     func finished() bool { return self.complete }
+    func final_url() HTTP.Url { return self.resolved_url }
+    func redirects() RedirectHop[] { return self.redirect_hops }
 
     func read(maximum_bytes:int = 8_192) Result<uint8[], HTTP.Error> {
         if maximum_bytes <= 0 {
@@ -292,7 +384,7 @@ public class IncomingResponse {
                 }
                 self.remaining -= bytes.count()
                 self.total += bytes.count()
-                if self.remaining == 0 { self.complete = true }
+                if self.remaining == 0 { self.complete = true; self.finish_connection() }
                 return Result<uint8[], HTTP.Error>.success(bytes)
             }
             if self.framing_kind == 2 { return self.read_chunk(stream, maximum_bytes) }
@@ -390,7 +482,11 @@ public class IncomingResponse {
                 success => {}
                 failure(error) => { return Result<uint8[], HTTP.Error>.failure(error) }
             }
-            if count == 0 { self.complete = true; return Result<uint8[], HTTP.Error>.success(result) }
+            if count == 0 {
+                self.complete = true
+                self.finish_connection()
+                return Result<uint8[], HTTP.Error>.success(result)
+            }
             result.append(byte[0])
             self.total++
             if self.total > self.limits.maximum_body_bytes {
@@ -427,6 +523,7 @@ public class IncomingResponse {
                     failure(error) => { return Result<uint8[], HTTP.Error>.failure(error) }
                 }
                 self.complete = true
+                self.finish_connection()
                 return Result<uint8[], HTTP.Error>.success([])
             }
             if size > self.limits.maximum_body_bytes - self.total {
@@ -504,6 +601,779 @@ public class IncomingResponse {
         if var value = self.deadline { return value }
         panic("incoming HTTP response deadline is unavailable")
     }
+
+    private func finish_connection() {
+        if var stream = self.connection {
+            self.connection = null
+            if self.reusable {
+                if var session = self.owner {
+                    self.owner = null
+                    session.release(self.origin, stream)
+                    return
+                }
+            }
+            self.owner = null
+            close_connection(stream)
+        }
+    }
+}
+
+struct PooledConnection {
+    let origin:str
+    var connection:Connection
+}
+
+struct StoredCookie {
+    let name:str
+    let value:str
+    let host:str
+    let path:str
+    let secure:bool
+}
+
+public class Session {
+    private let shared_options:Options
+    private var shared_headers:HTTP.Headers
+    private var cookie_storage_enabled:bool
+    private var cookie_storage:StoredCookie[]
+    private var idle_connections:PooledConnection[]
+    private var closed:bool
+
+    package init(options:Options) {
+        self.shared_options = options
+        self.shared_headers = HTTP.Headers()
+        self.cookie_storage_enabled = false
+        self.cookie_storage = []
+        self.idle_connections = []
+        self.closed = false
+    }
+
+    static func create() Result<Session, HTTP.Error> { return Session.create(default_options()) }
+
+    static func create(options:Options) Result<Session, HTTP.Error> {
+        match validate_options(options) {
+            success => {}
+            failure(error) => { return Result<Session, HTTP.Error>.failure(error) }
+        }
+        return Result<Session, HTTP.Error>.success(Session(options))
+    }
+
+    func options() Options { return self.shared_options }
+    func is_closed() bool { return self.closed }
+    func idle_connection_count() int { return self.idle_connections.count() }
+    func cookie_count() int { return self.cookie_storage.count() }
+
+    func set_default_header(name:str, value:str) Result<void, HTTP.Error> {
+        if self.closed { return session_closed_void() }
+        return self.shared_headers.try_set(name, value)
+    }
+
+    func append_default_header(name:str, value:str) Result<void, HTTP.Error> {
+        if self.closed { return session_closed_void() }
+        return self.shared_headers.try_append(name, value)
+    }
+
+    func remove_default_header(name:str) int {
+        if self.closed { return 0 }
+        return self.shared_headers.remove(name)
+    }
+
+    func clear_default_headers() {
+        if self.closed { return }
+        self.shared_headers = HTTP.Headers()
+    }
+
+    func authenticate_bearer(token:str) Result<void, HTTP.Error> {
+        if token == "" {
+            return Result<void, HTTP.Error>.failure(HTTP.failure(
+                HTTP.ErrorKind.invalid_configuration, null, "Bearer token must not be empty"
+            ))
+        }
+        return self.set_default_header("Authorization", "Bearer " + token)
+    }
+
+    func authenticate_basic(username:str, password:str) Result<void, HTTP.Error> {
+        return self.set_default_header(
+            "Authorization", "Basic " + base64(UTF8.bytes(username + ":" + password))
+        )
+    }
+
+    func clear_authentication() { self.remove_default_header("Authorization") }
+
+    func enable_cookies(enabled:bool = true) {
+        if self.closed { return }
+        self.cookie_storage_enabled = enabled
+    }
+
+    func cookies_enabled() bool { return self.cookie_storage_enabled }
+    func clear_cookies() { self.cookie_storage.clear() }
+
+    func get(url:str) Result<Exchange, HTTP.Error> {
+        var parsed = empty_url()
+        match HTTP.Url.parse(url) {
+            success(value) => { parsed = value }
+            failure(error) => { return Result<Exchange, HTTP.Error>.failure(error) }
+        }
+        var request = HTTP.Request.get(parsed.target)
+        return self.send_parsed(parsed, request)
+    }
+
+    func head(url:str) Result<Exchange, HTTP.Error> {
+        var parsed = empty_url()
+        match HTTP.Url.parse(url) {
+            success(value) => { parsed = value }
+            failure(error) => { return Result<Exchange, HTTP.Error>.failure(error) }
+        }
+        var request = HTTP.Request.head(parsed.target)
+        return self.send_parsed(parsed, request)
+    }
+
+    func delete(url:str) Result<Exchange, HTTP.Error> {
+        var parsed = empty_url()
+        match HTTP.Url.parse(url) {
+            success(value) => { parsed = value }
+            failure(error) => { return Result<Exchange, HTTP.Error>.failure(error) }
+        }
+        var request = HTTP.Request.delete(parsed.target)
+        return self.send_parsed(parsed, request)
+    }
+
+    func post(
+        url:str,
+        text:str,
+        content_type:str = "text/plain; charset=utf-8"
+    ) Result<Exchange, HTTP.Error> {
+        return self.send_text(HTTP.Method.post, url, text, content_type)
+    }
+
+    func put(
+        url:str,
+        text:str,
+        content_type:str = "text/plain; charset=utf-8"
+    ) Result<Exchange, HTTP.Error> {
+        return self.send_text(HTTP.Method.put, url, text, content_type)
+    }
+
+    func patch(
+        url:str,
+        text:str,
+        content_type:str = "text/plain; charset=utf-8"
+    ) Result<Exchange, HTTP.Error> {
+        return self.send_text(HTTP.Method.patch, url, text, content_type)
+    }
+
+    func send(url:str, request:HTTP.Request) Result<Exchange, HTTP.Error> {
+        var parsed = empty_url()
+        match HTTP.Url.parse(url) {
+            success(value) => { parsed = value }
+            failure(error) => { return Result<Exchange, HTTP.Error>.failure(error) }
+        }
+        return self.send_parsed(parsed, request)
+    }
+
+    func open(url:str) Result<IncomingResponse, HTTP.Error> {
+        var parsed = empty_url()
+        match HTTP.Url.parse(url) {
+            success(value) => { parsed = value }
+            failure(error) => { return Result<IncomingResponse, HTTP.Error>.failure(error) }
+        }
+        var request = HTTP.Request.get(parsed.target)
+        return self.open_parsed(parsed, request)
+    }
+
+    func open_request(url:str, request:HTTP.Request) Result<IncomingResponse, HTTP.Error> {
+        var parsed = empty_url()
+        match HTTP.Url.parse(url) {
+            success(value) => { parsed = value }
+            failure(error) => { return Result<IncomingResponse, HTTP.Error>.failure(error) }
+        }
+        return self.open_parsed(parsed, request)
+    }
+
+    func download<W:IO.Writer>(url:str, output:&W) Result<Exchange, HTTP.Error> {
+        return session_download<W>(self, url, output)
+    }
+
+    func send_stream<R:IO.Reader>(
+        url:str,
+        request:HTTP.Request,
+        input:&R,
+        content_length:int
+    ) Result<Exchange, HTTP.Error> {
+        return session_send_stream<R>(self, url, request, input, content_length)
+    }
+
+    func close() Result<void, HTTP.Error> {
+        if self.closed { return Result<void, HTTP.Error>.success() }
+        self.closed = true
+        var first:HTTP.Error? = null
+        while !self.idle_connections.is_empty() {
+            var pooled = self.idle_connections.take_last()
+            match pooled.connection.close() {
+                success => {}
+                failure(error) => { if first == null { first = error } }
+            }
+        }
+        if error = first { return Result<void, HTTP.Error>.failure(error) }
+        return Result<void, HTTP.Error>.success()
+    }
+
+    package func release(origin:str, connection:Connection) {
+        if self.closed || self.shared_options.maximum_idle_connections_per_origin == 0 {
+            close_connection(connection)
+            return
+        }
+        var count = 0
+        for pooled in self.idle_connections { if pooled.origin == origin { count++ } }
+        if count >= self.shared_options.maximum_idle_connections_per_origin {
+            close_connection(connection)
+            return
+        }
+        self.idle_connections.append(PooledConnection(origin:origin, connection:connection))
+    }
+
+    drop { match self.close() { success => {}; failure(error) => {} } }
+
+    private func send_text(
+        method:HTTP.Method,
+        url:str,
+        text:str,
+        content_type:str
+    ) Result<Exchange, HTTP.Error> {
+        var parsed = empty_url()
+        match HTTP.Url.parse(url) {
+            success(value) => { parsed = value }
+            failure(error) => { return Result<Exchange, HTTP.Error>.failure(error) }
+        }
+        var request = HTTP.Request(method, parsed.target)
+        request.set_text(text, content_type)
+        return self.send_parsed(parsed, request)
+    }
+
+    private func send_parsed(
+        url:HTTP.Url,
+        request:HTTP.Request
+    ) Result<Exchange, HTTP.Error> {
+        var incoming:IncomingResponse? = null
+        match self.open_parsed(url, request) {
+            success(value) => { incoming = value }
+            failure(error) => { return Result<Exchange, HTTP.Error>.failure(error) }
+        }
+        if incoming == null { return session_closed_exchange() }
+        var result:IncomingResponse = incoming!
+        var body:uint8[] = []
+        match result.read_all() {
+            success(value) => { body = value }
+            failure(error) => {
+                close_incoming(result)
+                return Result<Exchange, HTTP.Error>.failure(error)
+            }
+        }
+        var response = result.response()
+        response.replace_body(body)
+        return Result<Exchange, HTTP.Error>.success(Exchange(
+            response:response,
+            final_url:result.final_url(),
+            redirects:result.redirects()
+        ))
+    }
+
+    private func open_parsed(
+        url:HTTP.Url,
+        request:HTTP.Request
+    ) Result<IncomingResponse, HTTP.Error> {
+        if self.closed { return session_closed_incoming() }
+        var deadline = HTTP.DeadlineBudget(self.shared_options.total_timeout_milliseconds)
+        var current_url = url
+        var current_request = request
+        var redirects:RedirectHop[] = []
+        var allow_sensitive_defaults = true
+        while true {
+            self.prepare_request(current_url, current_request, allow_sensitive_defaults)
+            match deadline.check("HTTP request") {
+                success => {}
+                failure(error) => { return Result<IncomingResponse, HTTP.Error>.failure(error) }
+            }
+            var incoming:IncomingResponse? = null
+            match self.open_once(current_url, current_request, deadline, redirects) {
+                success(value) => { incoming = value }
+                failure(error) => { return Result<IncomingResponse, HTTP.Error>.failure(error) }
+            }
+            if incoming == null { return session_closed_incoming() }
+            var active:IncomingResponse = incoming!
+            var response = active.response()
+            self.capture_cookies(current_url, response.headers())
+            if !response.is_redirect() || self.shared_options.maximum_redirects == 0 {
+                return Result<IncomingResponse, HTTP.Error>.success(active)
+            }
+            var location = ""
+            if let value = response.location() { location = value }
+            else { return Result<IncomingResponse, HTTP.Error>.success(active) }
+            if redirects.count() >= self.shared_options.maximum_redirects {
+                close_incoming(active)
+                return Result<IncomingResponse, HTTP.Error>.failure(HTTP.failure(
+                    HTTP.ErrorKind.redirect_limit, location, "HTTP redirect limit exceeded"
+                ))
+            }
+            var next_url = empty_url()
+            match current_url.resolve(location) {
+                success(value) => { next_url = value }
+                failure(error) => {
+                    close_incoming(active)
+                    return Result<IncomingResponse, HTTP.Error>.failure(error)
+                }
+            }
+            if current_url.scheme == "https" && next_url.scheme == "http" &&
+                !self.shared_options.allow_insecure_redirects {
+                close_incoming(active)
+                return Result<IncomingResponse, HTTP.Error>.failure(HTTP.failure(
+                    HTTP.ErrorKind.insecure_redirect,
+                    location,
+                    "HTTPS redirect to cleartext HTTP is disabled"
+                ))
+            }
+            match active.discard() {
+                success => {}
+                failure(error) => {
+                    close_incoming(active)
+                    return Result<IncomingResponse, HTTP.Error>.failure(error)
+                }
+            }
+            redirects.append(RedirectHop(
+                url:current_url,
+                status:response.status(),
+                location:location,
+                next_url:next_url
+            ))
+            let same = same_origin(current_url, next_url)
+            current_request = redirect_request(current_request, response.status(), next_url, same)
+            if !same { allow_sensitive_defaults = false }
+            current_url = next_url
+            match deadline.check("HTTP redirect") {
+                success => {}
+                failure(error) => { return Result<IncomingResponse, HTTP.Error>.failure(error) }
+            }
+        }
+        panic("HTTP session redirect loop terminated unexpectedly")
+    }
+
+    private func open_once(
+        url:HTTP.Url,
+        request:HTTP.Request,
+        deadline:HTTP.DeadlineBudget,
+        redirects:RedirectHop[]
+    ) Result<IncomingResponse, HTTP.Error> {
+        var connection:Connection? = null
+        match self.acquire(url, deadline) {
+            success(value) => { connection = value }
+            failure(error) => { return Result<IncomingResponse, HTTP.Error>.failure(error) }
+        }
+        if connection == null { return session_closed_incoming() }
+        var active:Connection = connection!
+        match Codec.write_request<Connection>(active, request, deadline) {
+            success => {}
+            failure(error) => {
+                close_connection(active)
+                return Result<IncomingResponse, HTTP.Error>.failure(error)
+            }
+        }
+        var response = HTTP.Response(500)
+        match Codec.read_final_response_head<Connection>(
+            active, self.shared_options.limits, deadline
+        ) {
+            success(value) => { response = value }
+            failure(error) => {
+                close_connection(active)
+                return Result<IncomingResponse, HTTP.Error>.failure(error)
+            }
+        }
+        let reusable = response_reusable(request, response)
+        match IncomingResponse.start(
+            response,
+            active,
+            self.shared_options.limits,
+            response_has_body(request, response),
+            deadline,
+            IncomingContext(
+                owner:self,
+                origin:origin_key(url),
+                reusable:reusable,
+                resolved_url:url,
+                redirects:redirects
+            )
+        ) {
+            success(value) => { return Result<IncomingResponse, HTTP.Error>.success(value) }
+            failure(error) => {
+                close_connection(active)
+                return Result<IncomingResponse, HTTP.Error>.failure(error)
+            }
+        }
+    }
+
+    package func acquire(
+        url:HTTP.Url,
+        deadline:HTTP.DeadlineBudget
+    ) Result<Connection, HTTP.Error> {
+        let expected = origin_key(url)
+        var index = self.idle_connections.count() - 1
+        while index >= 0 && !self.idle_connections.is_empty() {
+            if self.idle_connections[index].origin == expected {
+                var pooled = self.idle_connections.take(index)
+                return Result<Connection, HTTP.Error>.success(pooled.connection)
+            }
+            index--
+        }
+        if url.scheme == "http" {
+            match connect(url, self.shared_options, deadline) {
+                success(stream) => {
+                    return Result<Connection, HTTP.Error>.success(Connection.plain(stream))
+                }
+                failure(error) => { return Result<Connection, HTTP.Error>.failure(error) }
+            }
+        }
+        if url.scheme == "https" {
+            match connect_tls(url, self.shared_options, deadline) {
+                success(stream) => {
+                    return Result<Connection, HTTP.Error>.success(Connection.secure(stream))
+                }
+                failure(error) => { return Result<Connection, HTTP.Error>.failure(error) }
+            }
+        }
+        return Result<Connection, HTTP.Error>.failure(HTTP.failure(
+            HTTP.ErrorKind.unsupported_scheme, url.scheme, "HTTP supports only http and https URLs"
+        ))
+    }
+
+    package func prepare_request(url:HTTP.Url, request:HTTP.Request, sensitive:bool) {
+        var headers = request.headers()
+        for header in self.shared_headers.values() {
+            let name = HTTP.ascii_lower(header.name)
+            let secret = name == "authorization" || name == "proxy-authorization" || name == "cookie"
+            if !headers.contains(header.name) && (sensitive || !secret) {
+                headers.append(header.name, header.value)
+            }
+        }
+        headers.set("Host", url.authority())
+        if !headers.contains("User-Agent") { headers.set("User-Agent", "Silex-HTTP/0.4") }
+        headers.set("Connection", "keep-alive")
+        if self.cookie_storage_enabled && !headers.contains("Cookie") {
+            let value = self.cookie_header(url)
+            if value != "" { headers.set("Cookie", value) }
+        }
+    }
+
+    package func capture_cookies(url:HTTP.Url, headers:HTTP.Headers) {
+        if !self.cookie_storage_enabled { return }
+        for value in headers.get_all("Set-Cookie") {
+            if update = parse_cookie(url, value) {
+                var index = self.cookie_storage.count() - 1
+                while index >= 0 && !self.cookie_storage.is_empty() {
+                    let stored = self.cookie_storage[index]
+                    if stored.name == update.cookie.name && stored.host == update.cookie.host &&
+                        stored.path == update.cookie.path {
+                        self.cookie_storage.take(index)
+                    }
+                    index--
+                }
+                if !update.remove { self.cookie_storage.append(update.cookie) }
+            }
+        }
+    }
+
+    private func cookie_header(url:HTTP.Url) str {
+        var result = ""
+        let host = HTTP.ascii_lower(url.host)
+        let path = url.path()
+        for cookie in self.cookie_storage {
+            if cookie.host == host && (!cookie.secure || url.scheme == "https") &&
+                cookie_path_matches(path, cookie.path) {
+                if result != "" { result += "; " }
+                result += cookie.name + "=" + cookie.value
+            }
+        }
+        return result
+    }
+}
+
+struct CookieUpdate {
+    let cookie:StoredCookie
+    let remove:bool
+}
+
+func session_download<W:IO.Writer>(
+    session:Session,
+    url:str,
+    output:&W
+) Result<Exchange, HTTP.Error> {
+    var incoming = try session.open(url)
+    match incoming.copy_to<W>(output) {
+        failure(error) => {
+            close_incoming(incoming)
+            return Result<Exchange, HTTP.Error>.failure(error)
+        }
+        success(count) => {}
+    }
+    return Result<Exchange, HTTP.Error>.success(Exchange(
+        response:incoming.response(),
+        final_url:incoming.final_url(),
+        redirects:incoming.redirects()
+    ))
+}
+
+func session_send_stream<R:IO.Reader>(
+    session:Session,
+    url:str,
+    request:HTTP.Request,
+    input:&R,
+    content_length:int
+) Result<Exchange, HTTP.Error> {
+    if session.is_closed() { return session_closed_exchange() }
+    let options = session.options()
+    let parsed = try HTTP.Url.parse(url)
+    var deadline = HTTP.DeadlineBudget(options.total_timeout_milliseconds)
+    session.prepare_request(parsed, request, true)
+    var active = try session.acquire(parsed, deadline)
+    match Codec.write_request_from<Connection, R>(
+        active,
+        request,
+        input,
+        content_length,
+        options.limits.maximum_body_bytes,
+        deadline
+    ) {
+        failure(error) => {
+            close_connection(active)
+            return Result<Exchange, HTTP.Error>.failure(error)
+        }
+        success => {}
+    }
+    var response = HTTP.Response(500)
+    match Codec.read_final_response_head<Connection>(active, options.limits, deadline) {
+        failure(error) => {
+            close_connection(active)
+            return Result<Exchange, HTTP.Error>.failure(error)
+        }
+        success(value) => { response = value }
+    }
+    session.capture_cookies(parsed, response.headers())
+    let reusable = response_reusable(request, response)
+    var incoming = try IncomingResponse.start(
+        response,
+        active,
+        options.limits,
+        response_has_body(request, response),
+        deadline,
+        IncomingContext(
+            owner:session,
+            origin:origin_key(parsed),
+            reusable:reusable,
+            resolved_url:parsed,
+            redirects:[]
+        )
+    )
+    var body:uint8[] = []
+    match incoming.read_all() {
+        success(value) => { body = value }
+        failure(error) => {
+            close_incoming(incoming)
+            return Result<Exchange, HTTP.Error>.failure(error)
+        }
+    }
+    response.replace_body(body)
+    if response.is_redirect() && options.maximum_redirects > 0 {
+        return Result<Exchange, HTTP.Error>.failure(HTTP.failure(
+            HTTP.ErrorKind.body_stream,
+            response.location(),
+            "a streaming request body cannot be replayed automatically after a redirect"
+        ))
+    }
+    return Result<Exchange, HTTP.Error>.success(Exchange(
+        response:response, final_url:parsed, redirects:[]
+    ))
+}
+
+func session_closed_void() Result<void, HTTP.Error> {
+    return Result<void, HTTP.Error>.failure(HTTP.failure(
+        HTTP.ErrorKind.closed, null, "HTTP client session is closed"
+    ))
+}
+
+func session_closed_exchange() Result<Exchange, HTTP.Error> {
+    return Result<Exchange, HTTP.Error>.failure(HTTP.failure(
+        HTTP.ErrorKind.closed, null, "HTTP client session is closed"
+    ))
+}
+
+func session_closed_incoming() Result<IncomingResponse, HTTP.Error> {
+    return Result<IncomingResponse, HTTP.Error>.failure(HTTP.failure(
+        HTTP.ErrorKind.closed, null, "HTTP client session is closed"
+    ))
+}
+
+func origin_key(url:HTTP.Url) str {
+    return HTTP.ascii_lower(url.scheme) + "://" + HTTP.ascii_lower(url.authority())
+}
+
+func empty_url() HTTP.Url {
+    return HTTP.Url(scheme:"http", host:"localhost", port:80, target:"/")
+}
+
+func response_reusable(request:HTTP.Request, response:HTTP.Response) bool {
+    return !header_has_token(request.headers(), "Connection", "close") &&
+        !header_has_token(response.headers(), "Connection", "close")
+}
+
+func header_has_token(headers:HTTP.Headers, name:str, expected:str) bool {
+    let lowered = HTTP.ascii_lower(expected)
+    for value in headers.get_all(name) {
+        for token in split(value, 44) {
+            if HTTP.ascii_lower(HTTP.trim(token)) == lowered { return true }
+        }
+    }
+    return false
+}
+
+func parse_cookie(url:HTTP.Url, value:str) CookieUpdate? {
+    let parts = split(value, 59)
+    if parts.is_empty() { return null }
+    let first = HTTP.trim(parts[0])
+    let separator = byte_index(first, 61)
+    if separator <= 0 { return null }
+    let name = text_slice(first, 0, separator)
+    if !valid_cookie_name(name) { return null }
+    let cookie_value = text_slice(first, separator + 1, byte_count(first))
+    var path = default_cookie_path(url.path())
+    var secure = false
+    var remove = false
+    var index = 1
+    while index < parts.count() {
+        let attribute = HTTP.trim(parts[index])
+        let equals = byte_index(attribute, 61)
+        var attribute_name = attribute
+        var attribute_value = ""
+        if equals >= 0 {
+            attribute_name = text_slice(attribute, 0, equals)
+            attribute_value = HTTP.trim(text_slice(
+                attribute, equals + 1, byte_count(attribute)
+            ))
+        }
+        let lowered = HTTP.ascii_lower(attribute_name)
+        if lowered == "path" && starts_with(attribute_value, "/") { path = attribute_value }
+        elif lowered == "secure" { secure = true }
+        elif lowered == "max-age" && attribute_value == "0" { remove = true }
+        index++
+    }
+    return CookieUpdate(
+        cookie:StoredCookie(
+            name:name,
+            value:cookie_value,
+            host:HTTP.ascii_lower(url.host),
+            path:path,
+            secure:secure
+        ),
+        remove:remove
+    )
+}
+
+func default_cookie_path(path:str) str {
+    let bytes = UTF8.bytes(path)
+    if bytes.count() == 0 || bytes[0] != 47 { return "/" }
+    var slash = bytes.count() - 1
+    while slash > 0 && bytes[slash] != 47 { slash-- }
+    if slash == 0 { return "/" }
+    return text_slice(path, 0, slash)
+}
+
+func valid_cookie_name(value:str) bool {
+    let bytes = UTF8.bytes(value)
+    if bytes.is_empty() { return false }
+    for byte in bytes {
+        if !HTTP.header_name_byte(byte) { return false }
+    }
+    return true
+}
+
+func split(value:str, separator:uint8) str[] {
+    let bytes = UTF8.bytes(value)
+    var result:str[] = []
+    var start = 0
+    var index = 0
+    while index <= bytes.count() {
+        if index == bytes.count() || bytes[index] == separator {
+            result.append(text_slice(value, start, index))
+            start = index + 1
+        }
+        index++
+    }
+    return result
+}
+
+func byte_index(value:str, expected:uint8) int {
+    let bytes = UTF8.bytes(value)
+    var index = 0
+    while index < bytes.count() {
+        if bytes[index] == expected { return index }
+        index++
+    }
+    return -1
+}
+
+func byte_count(value:str) int {
+    let bytes = UTF8.bytes(value)
+    return bytes.count()
+}
+
+func text_slice(value:str, start:int, end:int) str {
+    let bytes = UTF8.bytes(value)
+    if start >= end { return "" }
+    var result:uint8[] = []
+    var index = start
+    while index < end { result.append(bytes[index]); index++ }
+    return HTTP.text_from_bytes(result)
+}
+
+func starts_with(value:str, prefix:str) bool {
+    let bytes = UTF8.bytes(value)
+    let expected = UTF8.bytes(prefix)
+    if expected.count() > bytes.count() { return false }
+    var index = 0
+    while index < expected.count() {
+        if bytes[index] != expected[index] { return false }
+        index++
+    }
+    return true
+}
+
+func cookie_path_matches(request_path:str, cookie_path:str) bool {
+    if request_path == cookie_path { return true }
+    if !starts_with(request_path, cookie_path) { return false }
+    let cookie = UTF8.bytes(cookie_path)
+    let request = UTF8.bytes(request_path)
+    if cookie.is_empty() { return false }
+    if cookie[-1] == 47 { return true }
+    return request.count() > cookie.count() && request[cookie.count()] == 47
+}
+
+func base64(input:uint8[]) str {
+    let alphabet = UTF8.bytes("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
+    var output:uint8[] = []
+    var index = 0
+    while index < input.count() {
+        let remaining = input.count() - index
+        let first = input[index] as int
+        var second = 0
+        var third = 0
+        if remaining > 1 { second = input[index + 1] as int }
+        if remaining > 2 { third = input[index + 2] as int }
+        output.append(alphabet[first / 4])
+        output.append(alphabet[(first % 4) * 16 + second / 16])
+        if remaining > 1 { output.append(alphabet[(second % 16) * 4 + third / 64]) }
+        else { output.append(61 as uint8) }
+        if remaining > 2 { output.append(alphabet[third % 64]) }
+        else { output.append(61 as uint8) }
+        index += 3
+    }
+    return HTTP.text_from_bytes(output)
 }
 
 func standard_error(operation:str, detail:str) StandardError {
@@ -515,6 +1385,20 @@ func standard_error(operation:str, detail:str) StandardError {
     )
 }
 
+func close_session(session:Session) {
+    match session.close() { success => {}; failure(error) => {} }
+}
+
+func exchange_response(result:Result<Exchange, HTTP.Error>) Result<HTTP.Response, HTTP.Error> {
+    match result {
+        success(var exchange) => {
+            return Result<HTTP.Response, HTTP.Error>.success(exchange.response)
+        }
+        failure(error) => { return Result<HTTP.Response, HTTP.Error>.failure(error) }
+    }
+    panic("HTTP exchange result terminated unexpectedly")
+}
+
 public func get(url:str) Result<HTTP.Response, HTTP.Error> {
     return get(url, default_options())
 }
@@ -524,9 +1408,10 @@ public func open(url:str) Result<IncomingResponse, HTTP.Error> {
 }
 
 public func open(url:str, options:Options) Result<IncomingResponse, HTTP.Error> {
-    let parsed = try HTTP.Url.parse(url)
-    var request = HTTP.Request.get(parsed.target)
-    return open_parsed(parsed, request, options)
+    var session = try Session.create(options)
+    var result = session.open(url)
+    close_session(session)
+    return result
 }
 
 public func open_request(
@@ -541,30 +1426,35 @@ public func open_request(
     request:HTTP.Request,
     options:Options
 ) Result<IncomingResponse, HTTP.Error> {
-    let parsed = try HTTP.Url.parse(url)
-    return open_parsed(parsed, request, options)
+    var session = try Session.create(options)
+    var result = session.open_request(url, request)
+    close_session(session)
+    return result
 }
 
 public func get(url:str, options:Options) Result<HTTP.Response, HTTP.Error> {
-    let parsed = try HTTP.Url.parse(url)
-    var request = HTTP.Request.get(parsed.target)
-    return send_parsed(parsed, request, options)
+    var session = try Session.create(options)
+    var result = session.get(url)
+    close_session(session)
+    return exchange_response(result)
 }
 
 public func head(url:str) Result<HTTP.Response, HTTP.Error> { return head(url, default_options()) }
 
 public func head(url:str, options:Options) Result<HTTP.Response, HTTP.Error> {
-    let parsed = try HTTP.Url.parse(url)
-    var request = HTTP.Request.head(parsed.target)
-    return send_parsed(parsed, request, options)
+    var session = try Session.create(options)
+    var result = session.head(url)
+    close_session(session)
+    return exchange_response(result)
 }
 
 public func delete(url:str) Result<HTTP.Response, HTTP.Error> { return delete(url, default_options()) }
 
 public func delete(url:str, options:Options) Result<HTTP.Response, HTTP.Error> {
-    let parsed = try HTTP.Url.parse(url)
-    var request = HTTP.Request.delete(parsed.target)
-    return send_parsed(parsed, request, options)
+    var session = try Session.create(options)
+    var result = session.delete(url)
+    close_session(session)
+    return exchange_response(result)
 }
 
 public func post(
@@ -573,7 +1463,10 @@ public func post(
     options:Options = default_options(),
     content_type:str = "text/plain; charset=utf-8"
 ) Result<HTTP.Response, HTTP.Error> {
-    return send_text(HTTP.Method.post, url, text, content_type, options)
+    var session = try Session.create(options)
+    var result = session.post(url, text, content_type)
+    close_session(session)
+    return exchange_response(result)
 }
 
 public func put(
@@ -582,7 +1475,10 @@ public func put(
     options:Options = default_options(),
     content_type:str = "text/plain; charset=utf-8"
 ) Result<HTTP.Response, HTTP.Error> {
-    return send_text(HTTP.Method.put, url, text, content_type, options)
+    var session = try Session.create(options)
+    var result = session.put(url, text, content_type)
+    close_session(session)
+    return exchange_response(result)
 }
 
 public func patch(
@@ -591,7 +1487,10 @@ public func patch(
     options:Options = default_options(),
     content_type:str = "text/plain; charset=utf-8"
 ) Result<HTTP.Response, HTTP.Error> {
-    return send_text(HTTP.Method.patch, url, text, content_type, options)
+    var session = try Session.create(options)
+    var result = session.patch(url, text, content_type)
+    close_session(session)
+    return exchange_response(result)
 }
 
 public func download<W:IO.Writer>(url:str, output:&W) Result<HTTP.Response, HTTP.Error> {
@@ -599,9 +1498,10 @@ public func download<W:IO.Writer>(url:str, output:&W) Result<HTTP.Response, HTTP
 }
 
 public func download<W:IO.Writer>(url:str, output:&W, options:Options) Result<HTTP.Response, HTTP.Error> {
-    let parsed = try HTTP.Url.parse(url)
-    var request = HTTP.Request.get(parsed.target)
-    return download_parsed<W>(parsed, request, output, options)
+    var session = try Session.create(options)
+    var result = session_download<W>(session, url, output)
+    close_session(session)
+    return exchange_response(result)
 }
 
 public func send_stream<R:IO.Reader>(
@@ -620,16 +1520,10 @@ public func send_stream<R:IO.Reader>(
     content_length:int,
     options:Options
 ) Result<HTTP.Response, HTTP.Error> {
-    let parsed = try HTTP.Url.parse(url)
-    var response = try send_stream_parsed<R>(parsed, request, input, content_length, options)
-    if response.is_redirect() && options.maximum_redirects > 0 {
-        return Result<HTTP.Response, HTTP.Error>.failure(HTTP.failure(
-            HTTP.ErrorKind.body_stream,
-            response.location(),
-            "a streaming request body cannot be replayed automatically after a redirect"
-        ))
-    }
-    return Result<HTTP.Response, HTTP.Error>.success(response)
+    var session = try Session.create(options)
+    var result = session_send_stream<R>(session, url, request, input, content_length)
+    close_session(session)
+    return exchange_response(result)
 }
 
 public func send(url:str, request:HTTP.Request) Result<HTTP.Response, HTTP.Error> {
@@ -641,185 +1535,24 @@ public func send(
     request:HTTP.Request,
     options:Options
 ) Result<HTTP.Response, HTTP.Error> {
-    let parsed = try HTTP.Url.parse(url)
-    return send_parsed(parsed, request, options)
-}
-
-struct DownloadResult {
-    var response:HTTP.Response
-    let streamed:bool
-}
-
-func open_parsed(
-    url:HTTP.Url,
-    request:HTTP.Request,
-    options:Options
-) Result<IncomingResponse, HTTP.Error> {
-    try validate_options(options)
-    var deadline = HTTP.DeadlineBudget(options.total_timeout_milliseconds)
-    var current_url = url
-    var current_request = request
-    var redirects = 0
-    while true {
-        prepare_request(current_url, current_request)
-        var incoming = try open_once(current_url, current_request, options, deadline)
-        var response = incoming.response()
-        if !response.is_redirect() || options.maximum_redirects == 0 {
-            return Result<IncomingResponse, HTTP.Error>.success(incoming)
-        }
-        var location = ""
-        if let value = response.location() { location = value }
-        else { return Result<IncomingResponse, HTTP.Error>.success(incoming) }
-        if redirects >= options.maximum_redirects {
-            match incoming.close() { success => {}; failure(error) => {} }
-            return Result<IncomingResponse, HTTP.Error>.failure(HTTP.failure(
-                HTTP.ErrorKind.redirect_limit, location, "HTTP redirect limit exceeded"
-            ))
-        }
-        let next_url = try current_url.resolve(location)
-        if current_url.scheme == "https" && next_url.scheme == "http" && !options.allow_insecure_redirects {
-            match incoming.close() { success => {}; failure(error) => {} }
-            return Result<IncomingResponse, HTTP.Error>.failure(HTTP.failure(
-                HTTP.ErrorKind.insecure_redirect,
-                location,
-                "HTTPS redirect to cleartext HTTP is disabled"
-            ))
-        }
-        match incoming.close() { success => {}; failure(error) => {} }
-        current_request = redirect_request(
-            current_request, response.status(), next_url, same_origin(current_url, next_url)
-        )
-        current_url = next_url
-        redirects++
-        try deadline.check("HTTP redirect")
-    }
-    panic("HTTP streaming redirect loop terminated unexpectedly")
-}
-
-func open_once(
-    url:HTTP.Url,
-    request:HTTP.Request,
-    options:Options,
-    deadline:HTTP.DeadlineBudget
-) Result<IncomingResponse, HTTP.Error> {
-    var connection = Connection(null, null)
-    if url.scheme == "http" {
-        var stream = try connect(url, options, deadline)
-        connection = Connection.plain(stream)
-    } elif url.scheme == "https" {
-        var stream = try connect_tls(url, options, deadline)
-        connection = Connection.secure(stream)
-    } else {
-        return Result<IncomingResponse, HTTP.Error>.failure(HTTP.failure(
-            HTTP.ErrorKind.unsupported_scheme, url.scheme, "HTTP supports only http and https URLs"
-        ))
-    }
-    match Codec.write_request<Connection>(connection, request, deadline) {
-        success => {}
-        failure(error) => {
-            close_connection(connection)
-            return Result<IncomingResponse, HTTP.Error>.failure(error)
-        }
-    }
-    var response = HTTP.Response(500)
-    match Codec.read_final_response_head<Connection>(connection, options.limits, deadline) {
-        success(value) => { response = value }
-        failure(error) => {
-            close_connection(connection)
-            return Result<IncomingResponse, HTTP.Error>.failure(error)
-        }
-    }
-    let expect_body = response_has_body(request, response)
-    match IncomingResponse.start(response, connection, options.limits, expect_body, deadline) {
-        success(value) => { return Result<IncomingResponse, HTTP.Error>.success(value) }
-        failure(error) => {
-            close_connection(connection)
-            return Result<IncomingResponse, HTTP.Error>.failure(error)
-        }
-    }
+    var session = try Session.create(options)
+    var result = session.send(url, request)
+    close_session(session)
+    return exchange_response(result)
 }
 
 func close_connection(connection:Connection) {
     match connection.close() { success => {}; failure(error) => {} }
 }
 
+func close_incoming(incoming:IncomingResponse) {
+    match incoming.close() { success => {}; failure(error) => {} }
+}
+
 func response_has_body(request:HTTP.Request, response:HTTP.Response) bool {
     if request.method() == HTTP.Method.head { return false }
     let status = response.status()
     return !((status >= 100 && status < 200) || status == 204 || status == 304)
-}
-
-func send_text(
-    method:HTTP.Method,
-    url:str,
-    text:str,
-    content_type:str,
-    options:Options
-) Result<HTTP.Response, HTTP.Error> {
-    let parsed = try HTTP.Url.parse(url)
-    var request = HTTP.Request(method, parsed.target)
-    request.set_text(text, content_type)
-    return send_parsed(parsed, request, options)
-}
-
-func send_parsed(
-    url:HTTP.Url,
-    request:HTTP.Request,
-    options:Options
-) Result<HTTP.Response, HTTP.Error> {
-    try validate_options(options)
-    var deadline = HTTP.DeadlineBudget(options.total_timeout_milliseconds)
-    var current_url = url
-    var current_request = request
-    var redirects = 0
-    while true {
-        prepare_request(current_url, current_request)
-        try deadline.check("HTTP request")
-        var response = try send_once(current_url, current_request, options, deadline)
-        if !response.is_redirect() || options.maximum_redirects == 0 { return Result<HTTP.Response, HTTP.Error>.success(response) }
-        var location = ""
-        if let value = response.location() { location = value }
-        else { return Result<HTTP.Response, HTTP.Error>.success(response) }
-        if redirects >= options.maximum_redirects {
-            return Result<HTTP.Response, HTTP.Error>.failure(HTTP.failure(
-                HTTP.ErrorKind.redirect_limit, location, "HTTP redirect limit exceeded"
-            ))
-        }
-        let next_url = try current_url.resolve(location)
-        try deadline.check("HTTP redirect")
-        if current_url.scheme == "https" && next_url.scheme == "http" && !options.allow_insecure_redirects {
-            return Result<HTTP.Response, HTTP.Error>.failure(HTTP.failure(
-                HTTP.ErrorKind.insecure_redirect,
-                location,
-                "HTTPS redirect to cleartext HTTP is disabled"
-            ))
-        }
-        current_request = redirect_request(current_request, response.status(), next_url, same_origin(current_url, next_url))
-        current_url = next_url
-        redirects++
-    }
-    panic("HTTP redirect loop terminated unexpectedly")
-}
-
-func send_once(
-    url:HTTP.Url,
-    request:HTTP.Request,
-    options:Options,
-    deadline:HTTP.DeadlineBudget
-) Result<HTTP.Response, HTTP.Error> {
-    if url.scheme == "http" { return send_tcp(url, request, options, deadline) }
-    if url.scheme == "https" { return send_tls(url, request, options, deadline) }
-    return Result<HTTP.Response, HTTP.Error>.failure(HTTP.failure(
-        HTTP.ErrorKind.unsupported_scheme,
-        url.scheme,
-        "HTTP supports only http and https URLs"
-    ))
-}
-
-func prepare_request(url:HTTP.Url, request:HTTP.Request) {
-    var headers = request.headers()
-    headers.set("Host", url.authority())
-    if !headers.contains("User-Agent") { headers.set("User-Agent", "Silex-HTTP/0.3") }
 }
 
 package func redirect_request(
@@ -858,246 +1591,17 @@ package func same_origin(left:HTTP.Url, right:HTTP.Url) bool {
         left.port == right.port
 }
 
-func send_tcp(
-    url:HTTP.Url,
-    request:HTTP.Request,
-    options:Options,
-    deadline:HTTP.DeadlineBudget
-) Result<HTTP.Response, HTTP.Error> {
-    var stream = try connect(url, options, deadline)
-    match Codec.write_request<TCP.Stream>(stream, request, deadline) {
-        failure(error) => {
-            close_stream(stream)
-            return Result<HTTP.Response, HTTP.Error>.failure(error)
-        }
-        success => {}
-    }
-    var result = Codec.read_response<TCP.Stream>(
-        stream, options.limits, request.method() != HTTP.Method.head, deadline
-    )
-    close_stream(stream)
-    return result
-}
-
-func send_tls(
-    url:HTTP.Url,
-    request:HTTP.Request,
-    options:Options,
-    deadline:HTTP.DeadlineBudget
-) Result<HTTP.Response, HTTP.Error> {
-    var stream = try connect_tls(url, options, deadline)
-    return send_tls_connected(stream, request, options, deadline)
-}
-
-func send_tls_connected(
-    stream:TLS.Stream,
-    request:HTTP.Request,
-    options:Options,
-    deadline:HTTP.DeadlineBudget
-) Result<HTTP.Response, HTTP.Error> {
-    var connection = stream
-    match Codec.write_request<TLS.Stream>(connection, request, deadline) {
-        failure(error) => {
-            close_tls(connection)
-            return Result<HTTP.Response, HTTP.Error>.failure(error)
-        }
-        success => {}
-    }
-    var result = Codec.read_response<TLS.Stream>(
-        connection, options.limits, request.method() != HTTP.Method.head, deadline
-    )
-    close_tls(connection)
-    return result
-}
-
-func download_parsed<W:IO.Writer>(
-    url:HTTP.Url,
-    request:HTTP.Request,
-    output:&W,
-    options:Options
-) Result<HTTP.Response, HTTP.Error> {
-    try validate_options(options)
-    var deadline = HTTP.DeadlineBudget(options.total_timeout_milliseconds)
-    var current_url = url
-    var current_request = request
-    var redirects = 0
-    while true {
-        prepare_request(current_url, current_request)
-        var result = try download_once<W>(
-            current_url,
-            current_request,
-            output,
-            options,
-            options.maximum_redirects > 0,
-            deadline
-        )
-        if result.streamed || !result.response.is_redirect() {
-            return Result<HTTP.Response, HTTP.Error>.success(result.response)
-        }
-        var location = ""
-        if let value = result.response.location() { location = value }
-        else { return Result<HTTP.Response, HTTP.Error>.success(result.response) }
-        if redirects >= options.maximum_redirects {
-            return Result<HTTP.Response, HTTP.Error>.failure(HTTP.failure(
-                HTTP.ErrorKind.redirect_limit, location, "HTTP redirect limit exceeded"
-            ))
-        }
-        let next_url = try current_url.resolve(location)
-        try deadline.check("HTTP redirect")
-        if current_url.scheme == "https" && next_url.scheme == "http" && !options.allow_insecure_redirects {
-            return Result<HTTP.Response, HTTP.Error>.failure(HTTP.failure(
-                HTTP.ErrorKind.insecure_redirect, location, "HTTPS redirect to cleartext HTTP is disabled"
-            ))
-        }
-        current_request = redirect_request(current_request, result.response.status(), next_url, same_origin(current_url, next_url))
-        current_url = next_url
-        redirects++
-    }
-    panic("HTTP download redirect loop terminated unexpectedly")
-}
-
-func download_once<W:IO.Writer>(
-    url:HTTP.Url,
-    request:HTTP.Request,
-    output:&W,
-    options:Options,
-    may_follow:bool,
-    deadline:HTTP.DeadlineBudget
-) Result<DownloadResult, HTTP.Error> {
-    if url.scheme == "http" {
-        var stream = try connect(url, options, deadline)
-        match Codec.write_request<TCP.Stream>(stream, request, deadline) {
-            failure(error) => {
-                close_stream(stream)
-                return Result<DownloadResult, HTTP.Error>.failure(error)
-            }
-            success => {}
-        }
-        var result = download_connected<TCP.Stream, W>(
-            stream, request, output, options, may_follow, deadline
-        )
-        close_stream(stream)
-        return result
-    }
-    if url.scheme == "https" {
-        var stream = try connect_tls(url, options, deadline)
-        return download_tls_connected<W>(stream, request, output, options, may_follow, deadline)
-    }
-    return Result<DownloadResult, HTTP.Error>.failure(HTTP.failure(
-        HTTP.ErrorKind.unsupported_scheme, url.scheme, "HTTP supports only http and https URLs"
-    ))
-}
-
-func download_tls_connected<W:IO.Writer>(
-    stream:TLS.Stream,
-    request:HTTP.Request,
-    output:&W,
-    options:Options,
-    may_follow:bool,
-    deadline:HTTP.DeadlineBudget
-) Result<DownloadResult, HTTP.Error> {
-    var connection = stream
-    match Codec.write_request<TLS.Stream>(connection, request, deadline) {
-        failure(error) => {
-            close_tls(connection)
-            return Result<DownloadResult, HTTP.Error>.failure(error)
-        }
-        success => {}
-    }
-    var result = download_connected<TLS.Stream, W>(
-        connection, request, output, options, may_follow, deadline
-    )
-    close_tls(connection)
-    return result
-}
-
-func download_connected<T:IO.Reader, W:IO.Writer>(
-    connection:&T,
-    request:HTTP.Request,
-    output:&W,
-    options:Options,
-    may_follow:bool,
-    deadline:HTTP.DeadlineBudget
-) Result<DownloadResult, HTTP.Error> {
-    var response = try Codec.read_final_response_head<T>(connection, options.limits, deadline)
-    if may_follow && response.is_redirect() && response.location() != null {
-        return Result<DownloadResult, HTTP.Error>.success(DownloadResult(response:response, streamed:false))
-    }
-    if request.method() != HTTP.Method.head {
-        try Codec.copy_body<T, W>(
-            connection, output, response.headers(), options.limits, true, deadline
-        )
-    }
-    return Result<DownloadResult, HTTP.Error>.success(DownloadResult(response:response, streamed:true))
-}
-
-func send_stream_parsed<R:IO.Reader>(
-    url:HTTP.Url,
-    request:HTTP.Request,
-    input:&R,
-    content_length:int,
-    options:Options
-) Result<HTTP.Response, HTTP.Error> {
-    try validate_options(options)
-    var deadline = HTTP.DeadlineBudget(options.total_timeout_milliseconds)
-    prepare_request(url, request)
-    if url.scheme == "http" {
-        var stream = try connect(url, options, deadline)
-        match Codec.write_request_from<TCP.Stream, R>(
-            stream, request, input, content_length, options.limits.maximum_body_bytes, deadline
-        ) {
-            failure(error) => {
-                close_stream(stream)
-                return Result<HTTP.Response, HTTP.Error>.failure(error)
-            }
-            success => {}
-        }
-        var result = Codec.read_response<TCP.Stream>(
-            stream, options.limits, request.method() != HTTP.Method.head, deadline
-        )
-        close_stream(stream)
-        return result
-    }
-    if url.scheme == "https" {
-        var stream = try connect_tls(url, options, deadline)
-        return send_stream_tls_connected<R>(
-            stream, request, input, content_length, options, deadline
-        )
-    }
-    return Result<HTTP.Response, HTTP.Error>.failure(HTTP.failure(
-        HTTP.ErrorKind.unsupported_scheme, url.scheme, "HTTP supports only http and https URLs"
-    ))
-}
-
-func send_stream_tls_connected<R:IO.Reader>(
-    stream:TLS.Stream,
-    request:HTTP.Request,
-    input:&R,
-    content_length:int,
-    options:Options,
-    deadline:HTTP.DeadlineBudget
-) Result<HTTP.Response, HTTP.Error> {
-    var connection = stream
-    match Codec.write_request_from<TLS.Stream, R>(
-        connection, request, input, content_length, options.limits.maximum_body_bytes, deadline
-    ) {
-        failure(error) => {
-            close_tls(connection)
-            return Result<HTTP.Response, HTTP.Error>.failure(error)
-        }
-        success => {}
-    }
-    var result = Codec.read_response<TLS.Stream>(
-        connection, options.limits, request.method() != HTTP.Method.head, deadline
-    )
-    close_tls(connection)
-    return result
-}
-
 func validate_options(options:Options) Result<void, HTTP.Error> {
     if options.maximum_redirects < 0 {
         return Result<void, HTTP.Error>.failure(HTTP.failure(
             HTTP.ErrorKind.invalid_configuration, null, "maximum_redirects must be non-negative"
+        ))
+    }
+    if options.maximum_idle_connections_per_origin < 0 {
+        return Result<void, HTTP.Error>.failure(HTTP.failure(
+            HTTP.ErrorKind.invalid_configuration,
+            null,
+            "maximum_idle_connections_per_origin must be non-negative"
         ))
     }
     if negative_timeout(options.connect_timeout_milliseconds) ||
@@ -1269,12 +1773,4 @@ func ipv6_is_public(bytes:uint8[16]) bool {
         return ipv4_is_public([bytes[12], bytes[13], bytes[14], bytes[15]])
     }
     return true
-}
-
-func close_stream(stream:TCP.Stream) {
-    match TCP.close(move stream) { success => {}; failure(error) => {} }
-}
-
-func close_tls(stream:TLS.Stream) {
-    match TLS.close(stream) { success => {}; failure(error) => {} }
 }

@@ -55,6 +55,37 @@ func run(port:uint16) Result<void, HTTP.Error> {
     }
     print("ok - loopback policy")
 
+    var session = try Client.Session.create(
+        Client.default_options().with_maximum_idle_connections_per_origin(2)
+    )
+    try session.set_default_header("X-Session", "shared")
+    try session.authenticate_basic("user", "pass")
+    session.enable_cookies()
+    var login = try session.get(origin + "/session/login")
+    let peer = try login.response.text()
+    assert(login.final_url.text() == origin + "/session/login")
+    assert(login.redirects.count() == 0)
+    assert(session.idle_connection_count() == 1)
+
+    var basic = try session.get(origin + "/session/check")
+    assert(try basic.response.text() == peer + "|shared|Basic dXNlcjpwYXNz|sid=silex")
+    assert(session.idle_connection_count() == 1)
+
+    try session.authenticate_bearer("token")
+    var bearer = try session.get(origin + "/session/check")
+    assert(try bearer.response.text() == peer + "|shared|Bearer token|sid=silex")
+
+    var history = try session.get(origin + "/redirect")
+    assert(history.final_url.text() == origin + "/chunked")
+    assert(history.redirects.count() == 1)
+    assert(history.redirects[0].url.text() == origin + "/redirect")
+    assert(history.redirects[0].next_url.text() == origin + "/chunked")
+    assert(try history.response.text() == "chunked stream")
+    assert(session.idle_connection_count() == 1)
+    try session.close()
+    assert(session.is_closed())
+    print("ok - reusable session, keep-alive, auth, cookies and redirect history")
+
     var slow = try Client.open(
         origin + "/slow",
         Client.default_options().with_total_timeout(20)

@@ -54,6 +54,16 @@ func handle(
     response:Server.ResponseWriter
 ) Result<void, HTTP.Error> {
     try body.discard()
+    if request.path() == "/session/login" {
+        var login = HTTP.Response.text(200, peer_text(request))
+        login.headers().append("Set-Cookie", "sid=silex; Path=/session; HttpOnly")
+        return response.send(login)
+    }
+    if request.path() == "/session/check" {
+        let value = peer_text(request) + "|" + header(request, "X-Session") + "|" +
+            header(request, "Authorization") + "|" + header(request, "Cookie")
+        return response.send(HTTP.Response.text(200, value))
+    }
     if request.path() == "/redirect" {
         var redirect = HTTP.Response(302, "Found")
         redirect.headers().set("Location", "/chunked")
@@ -82,6 +92,16 @@ func handle(
         return response.stream_chunked<SlowReader>(head, source)
     }
     return response.send(HTTP.Response.text(404, "Not found"))
+}
+
+func peer_text(request:@HTTP.Request) str {
+    if let peer = request.peer() { return Network.format_endpoint(peer) }
+    return "unknown"
+}
+
+func header(request:@HTTP.Request, name:str) str {
+    if let value = request.headers().get(name) { return value }
+    return ""
 }
 
 func run(port:uint16) Result<void, HTTP.Error> {

@@ -178,13 +178,22 @@ package func write_request<T:IO.Writer>(
     request:@HTTP.Request,
     deadline:HTTP.DeadlineBudget
 ) Result<void, HTTP.Error> {
+    return write_request_mode<T>(writer, request, deadline, keep_alive(request.headers()))
+}
+
+package func write_request_mode<T:IO.Writer>(
+    writer:&T,
+    request:@HTTP.Request,
+    deadline:HTTP.DeadlineBudget,
+    persistent:bool
+) Result<void, HTTP.Error> {
     var bytes:uint8[] = []
     append_text(bytes, HTTP.method_text(request.method()) + " " + request.target() + " HTTP/1.1\r\n")
     var headers = request.headers()
     append_headers(bytes, headers)
     let body = request.body()
     append_text(bytes, "Content-Length: " + HTTP.decimal(body.count()) + "\r\n")
-    append_text(bytes, "Connection: close\r\n\r\n")
+    append_connection(bytes, persistent)
     for byte in body { bytes.append(byte) }
     return write_bytes<T>(writer, bytes, deadline)
 }
@@ -208,6 +217,21 @@ package func write_request_from<T:IO.Writer, R:IO.Reader>(
     maximum_body_bytes:int,
     deadline:HTTP.DeadlineBudget
 ) Result<void, HTTP.Error> {
+    return write_request_from_mode<T, R>(
+        writer, request, input, content_length, maximum_body_bytes, deadline,
+        keep_alive(request.headers())
+    )
+}
+
+package func write_request_from_mode<T:IO.Writer, R:IO.Reader>(
+    writer:&T,
+    request:@HTTP.Request,
+    input:&R,
+    content_length:int,
+    maximum_body_bytes:int,
+    deadline:HTTP.DeadlineBudget,
+    persistent:bool
+) Result<void, HTTP.Error> {
     if content_length < 0 {
         return Result<void, HTTP.Error>.failure(HTTP.failure(
             HTTP.ErrorKind.body_stream, null, "streaming request content length must be non-negative"
@@ -229,7 +253,7 @@ package func write_request_from<T:IO.Writer, R:IO.Reader>(
     var headers = request.headers()
     append_headers(bytes, headers)
     append_text(bytes, "Content-Length: " + HTTP.decimal(content_length) + "\r\n")
-    append_text(bytes, "Connection: close\r\n\r\n")
+    append_connection(bytes, persistent)
     try write_bytes<T>(writer, bytes, deadline)
     return copy_exact<R, T>(input, writer, content_length, deadline)
 }
@@ -249,6 +273,16 @@ package func write_response<T:IO.Writer>(
     include_body:bool,
     deadline:HTTP.DeadlineBudget
 ) Result<void, HTTP.Error> {
+    return write_response_mode<T>(writer, response, include_body, deadline, keep_alive(response.headers()))
+}
+
+package func write_response_mode<T:IO.Writer>(
+    writer:&T,
+    response:@HTTP.Response,
+    include_body:bool,
+    deadline:HTTP.DeadlineBudget,
+    persistent:bool
+) Result<void, HTTP.Error> {
     var bytes:uint8[] = []
     var reason = response.reason()
     append_text(bytes, "HTTP/1.1 " + HTTP.decimal(response.status()) + " " + reason + "\r\n")
@@ -258,7 +292,7 @@ package func write_response<T:IO.Writer>(
     var length = body.count()
     if body_forbidden(response.status()) { length = 0 }
     append_text(bytes, "Content-Length: " + HTTP.decimal(length) + "\r\n")
-    append_text(bytes, "Connection: close\r\n\r\n")
+    append_connection(bytes, persistent)
     if include_body && !body_forbidden(response.status()) {
         for byte in body { bytes.append(byte) }
     }
@@ -273,6 +307,22 @@ package func write_response_from<T:IO.Writer, R:IO.Reader>(
     maximum_body_bytes:int,
     include_body:bool,
     deadline:HTTP.DeadlineBudget
+) Result<void, HTTP.Error> {
+    return write_response_from_mode<T, R>(
+        writer, response, input, content_length, maximum_body_bytes, include_body, deadline,
+        keep_alive(response.headers())
+    )
+}
+
+package func write_response_from_mode<T:IO.Writer, R:IO.Reader>(
+    writer:&T,
+    response:@HTTP.Response,
+    input:&R,
+    content_length:int,
+    maximum_body_bytes:int,
+    include_body:bool,
+    deadline:HTTP.DeadlineBudget,
+    persistent:bool
 ) Result<void, HTTP.Error> {
     if content_length < 0 {
         return Result<void, HTTP.Error>.failure(HTTP.failure(
@@ -296,7 +346,7 @@ package func write_response_from<T:IO.Writer, R:IO.Reader>(
     var length = content_length
     if body_forbidden(response.status()) { length = 0 }
     append_text(bytes, "Content-Length: " + HTTP.decimal(length) + "\r\n")
-    append_text(bytes, "Connection: close\r\n\r\n")
+    append_connection(bytes, persistent)
     try write_bytes<T>(writer, bytes, deadline)
     if include_body && !body_forbidden(response.status()) {
         return copy_exact<R, T>(input, writer, content_length, deadline)
@@ -311,6 +361,21 @@ package func write_response_chunked<T:IO.Writer, R:IO.Reader>(
     maximum_body_bytes:int,
     include_body:bool,
     deadline:HTTP.DeadlineBudget
+) Result<void, HTTP.Error> {
+    return write_response_chunked_mode<T, R>(
+        writer, response, input, maximum_body_bytes, include_body, deadline,
+        keep_alive(response.headers())
+    )
+}
+
+package func write_response_chunked_mode<T:IO.Writer, R:IO.Reader>(
+    writer:&T,
+    response:@HTTP.Response,
+    input:&R,
+    maximum_body_bytes:int,
+    include_body:bool,
+    deadline:HTTP.DeadlineBudget,
+    persistent:bool
 ) Result<void, HTTP.Error> {
     if maximum_body_bytes < 0 {
         return Result<void, HTTP.Error>.failure(HTTP.failure(
@@ -328,7 +393,7 @@ package func write_response_chunked<T:IO.Writer, R:IO.Reader>(
     append_headers(bytes, response.headers())
     if body_forbidden(response.status()) { append_text(bytes, "Content-Length: 0\r\n") }
     else { append_text(bytes, "Transfer-Encoding: chunked\r\n") }
-    append_text(bytes, "Connection: close\r\n\r\n")
+    append_connection(bytes, persistent)
     try write_bytes<T>(writer, bytes, deadline)
     if !include_body || body_forbidden(response.status()) { return Result<void, HTTP.Error>.success() }
     var total = 0
@@ -862,6 +927,18 @@ func append_headers(bytes:&uint8[], headers:HTTP.Headers) {
         if name == "content-length" || name == "transfer-encoding" || name == "connection" { continue }
         append_text(bytes, header.name + ": " + header.value + "\r\n")
     }
+}
+
+func append_connection(bytes:&uint8[], persistent:bool) {
+    if persistent { append_text(bytes, "Connection: keep-alive\r\n\r\n") }
+    else { append_text(bytes, "Connection: close\r\n\r\n") }
+}
+
+func keep_alive(headers:HTTP.Headers) bool {
+    if let value = headers.get("Connection") {
+        return HTTP.ascii_lower(HTTP.trim(value)) == "keep-alive"
+    }
+    return false
 }
 
 func append_text(bytes:&uint8[], text:str) {

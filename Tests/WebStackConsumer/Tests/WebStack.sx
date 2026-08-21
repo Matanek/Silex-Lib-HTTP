@@ -5,6 +5,16 @@ use JSON
 use STD.Network.TLS
 use XML
 
+func require_session(result:Result<Client.Session, HTTP.Error>) Client.Session {
+    var output:Client.Session? = null
+    match result {
+        success(value) => { output = value }
+        failure(error) => { panic(error.detail) }
+    }
+    if var session = output { return session }
+    panic("public client session should be available")
+}
+
 test "compose public web package APIs" {
     var response = HTTP.Response.text(200, "{\"status\":\"ok\"}", "application/json")
     var response_text = ""
@@ -44,6 +54,17 @@ test "compose public web package APIs" {
     var headers = HTTP.Headers()
     match headers.try_set("Accept", "application/json") {
         success => { assert(headers.contains("Accept")) }
+        failure(error) => { panic(error.detail) }
+    }
+    var session = require_session(Client.Session.create(bounded))
+    match session.authenticate_basic("silex", "secret") {
+        success => {}
+        failure(error) => { panic(error.detail) }
+    }
+    session.enable_cookies()
+    assert(session.cookies_enabled())
+    match session.close() {
+        success => {}
         failure(error) => { panic(error.detail) }
     }
     assert(TLS.available())
