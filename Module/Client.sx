@@ -1,5 +1,6 @@
 use HTTP
 use HTTP.Codec
+use STD.IO
 use STD.Network.TCP
 use STD.Network.TLS
 
@@ -7,13 +8,47 @@ public struct Options {
     let limits:HTTP.Limits
     let read_timeout_milliseconds:int?
     let write_timeout_milliseconds:int?
+    let maximum_redirects:int
+    let allow_insecure_redirects:bool
+
+    func with_limits(value:HTTP.Limits) Options {
+        return Options(
+            limits:value,
+            read_timeout_milliseconds:self.read_timeout_milliseconds,
+            write_timeout_milliseconds:self.write_timeout_milliseconds,
+            maximum_redirects:self.maximum_redirects,
+            allow_insecure_redirects:self.allow_insecure_redirects
+        )
+    }
+
+    func with_redirects(maximum:int) Options {
+        return Options(
+            limits:self.limits,
+            read_timeout_milliseconds:self.read_timeout_milliseconds,
+            write_timeout_milliseconds:self.write_timeout_milliseconds,
+            maximum_redirects:maximum,
+            allow_insecure_redirects:self.allow_insecure_redirects
+        )
+    }
+
+    func with_insecure_redirects(allowed:bool = true) Options {
+        return Options(
+            limits:self.limits,
+            read_timeout_milliseconds:self.read_timeout_milliseconds,
+            write_timeout_milliseconds:self.write_timeout_milliseconds,
+            maximum_redirects:self.maximum_redirects,
+            allow_insecure_redirects:allowed
+        )
+    }
 }
 
 public func default_options() Options {
     return Options(
         limits:HTTP.default_limits(),
         read_timeout_milliseconds:30_000,
-        write_timeout_milliseconds:30_000
+        write_timeout_milliseconds:30_000,
+        maximum_redirects:10,
+        allow_insecure_redirects:false
     )
 }
 
@@ -25,6 +60,87 @@ public func get(url:str, options:Options) Result<HTTP.Response, HTTP.Error> {
     let parsed = try HTTP.Url.parse(url)
     var request = HTTP.Request.get(parsed.target)
     return send_parsed(parsed, request, options)
+}
+
+public func head(url:str) Result<HTTP.Response, HTTP.Error> { return head(url, default_options()) }
+
+public func head(url:str, options:Options) Result<HTTP.Response, HTTP.Error> {
+    let parsed = try HTTP.Url.parse(url)
+    var request = HTTP.Request.head(parsed.target)
+    return send_parsed(parsed, request, options)
+}
+
+public func delete(url:str) Result<HTTP.Response, HTTP.Error> { return delete(url, default_options()) }
+
+public func delete(url:str, options:Options) Result<HTTP.Response, HTTP.Error> {
+    let parsed = try HTTP.Url.parse(url)
+    var request = HTTP.Request.delete(parsed.target)
+    return send_parsed(parsed, request, options)
+}
+
+public func post(
+    url:str,
+    text:str,
+    options:Options = default_options(),
+    content_type:str = "text/plain; charset=utf-8"
+) Result<HTTP.Response, HTTP.Error> {
+    return send_text(HTTP.Method.post, url, text, content_type, options)
+}
+
+public func put(
+    url:str,
+    text:str,
+    options:Options = default_options(),
+    content_type:str = "text/plain; charset=utf-8"
+) Result<HTTP.Response, HTTP.Error> {
+    return send_text(HTTP.Method.put, url, text, content_type, options)
+}
+
+public func patch(
+    url:str,
+    text:str,
+    options:Options = default_options(),
+    content_type:str = "text/plain; charset=utf-8"
+) Result<HTTP.Response, HTTP.Error> {
+    return send_text(HTTP.Method.patch, url, text, content_type, options)
+}
+
+public func download<W:IO.Writer>(url:str, output:&W) Result<HTTP.Response, HTTP.Error> {
+    return download<W>(url, output, default_options())
+}
+
+public func download<W:IO.Writer>(url:str, output:&W, options:Options) Result<HTTP.Response, HTTP.Error> {
+    let parsed = try HTTP.Url.parse(url)
+    var request = HTTP.Request.get(parsed.target)
+    return download_parsed<W>(parsed, request, output, options)
+}
+
+public func send_stream<R:IO.Reader>(
+    url:str,
+    request:HTTP.Request,
+    input:&R,
+    content_length:int
+) Result<HTTP.Response, HTTP.Error> {
+    return send_stream<R>(url, request, input, content_length, default_options())
+}
+
+public func send_stream<R:IO.Reader>(
+    url:str,
+    request:HTTP.Request,
+    input:&R,
+    content_length:int,
+    options:Options
+) Result<HTTP.Response, HTTP.Error> {
+    let parsed = try HTTP.Url.parse(url)
+    var response = try send_stream_parsed<R>(parsed, request, input, content_length, options)
+    if response.is_redirect() && options.maximum_redirects > 0 {
+        return Result<HTTP.Response, HTTP.Error>.failure(HTTP.failure(
+            HTTP.ErrorKind.body_stream,
+            response.location(),
+            "a streaming request body cannot be replayed automatically after a redirect"
+        ))
+    }
+    return Result<HTTP.Response, HTTP.Error>.success(response)
 }
 
 public func send(url:str, request:HTTP.Request) Result<HTTP.Response, HTTP.Error> {
@@ -40,14 +156,69 @@ public func send(
     return send_parsed(parsed, request, options)
 }
 
+struct DownloadResult {
+    var response:HTTP.Response
+    let streamed:bool
+}
+
+func send_text(
+    method:HTTP.Method,
+    url:str,
+    text:str,
+    content_type:str,
+    options:Options
+) Result<HTTP.Response, HTTP.Error> {
+    let parsed = try HTTP.Url.parse(url)
+    var request = HTTP.Request(method, parsed.target)
+    request.set_text(text, content_type)
+    return send_parsed(parsed, request, options)
+}
+
 func send_parsed(
     url:HTTP.Url,
     request:HTTP.Request,
     options:Options
 ) Result<HTTP.Response, HTTP.Error> {
-    var headers = request.headers()
-    if !headers.contains("Host") { headers.set("Host", url.authority()) }
-    if !headers.contains("User-Agent") { headers.set("User-Agent", "Silex-HTTP/0.1") }
+    if options.maximum_redirects < 0 {
+        return Result<HTTP.Response, HTTP.Error>.failure(HTTP.failure(
+            HTTP.ErrorKind.redirect_limit, null, "maximum_redirects must be non-negative"
+        ))
+    }
+    var current_url = url
+    var current_request = request
+    var redirects = 0
+    while true {
+        prepare_request(current_url, current_request)
+        var response = try send_once(current_url, current_request, options)
+        if !response.is_redirect() || options.maximum_redirects == 0 { return Result<HTTP.Response, HTTP.Error>.success(response) }
+        var location = ""
+        if let value = response.location() { location = value }
+        else { return Result<HTTP.Response, HTTP.Error>.success(response) }
+        if redirects >= options.maximum_redirects {
+            return Result<HTTP.Response, HTTP.Error>.failure(HTTP.failure(
+                HTTP.ErrorKind.redirect_limit, location, "HTTP redirect limit exceeded"
+            ))
+        }
+        let next_url = try current_url.resolve(location)
+        if current_url.scheme == "https" && next_url.scheme == "http" && !options.allow_insecure_redirects {
+            return Result<HTTP.Response, HTTP.Error>.failure(HTTP.failure(
+                HTTP.ErrorKind.insecure_redirect,
+                location,
+                "HTTPS redirect to cleartext HTTP is disabled"
+            ))
+        }
+        current_request = redirect_request(current_request, response.status(), next_url, same_origin(current_url, next_url))
+        current_url = next_url
+        redirects++
+    }
+    panic("HTTP redirect loop terminated unexpectedly")
+}
+
+func send_once(
+    url:HTTP.Url,
+    request:HTTP.Request,
+    options:Options
+) Result<HTTP.Response, HTTP.Error> {
     if url.scheme == "http" { return send_tcp(url, request, options) }
     if url.scheme == "https" { return send_tls(url, request, options) }
     return Result<HTTP.Response, HTTP.Error>.failure(HTTP.failure(
@@ -55,6 +226,48 @@ func send_parsed(
         url.scheme,
         "HTTP supports only http and https URLs"
     ))
+}
+
+func prepare_request(url:HTTP.Url, request:HTTP.Request) {
+    var headers = request.headers()
+    headers.set("Host", url.authority())
+    if !headers.contains("User-Agent") { headers.set("User-Agent", "Silex-HTTP/0.2") }
+}
+
+package func redirect_request(
+    request:HTTP.Request,
+    status:int,
+    url:HTTP.Url,
+    preserve_sensitive:bool
+) HTTP.Request {
+    var method = request.method()
+    var preserve_body = true
+    if status == 303 && method != HTTP.Method.head {
+        method = HTTP.Method.get
+        preserve_body = false
+    } elif (status == 301 || status == 302) && method == HTTP.Method.post {
+        method = HTTP.Method.get
+        preserve_body = false
+    }
+    var redirected = HTTP.Request(method, url.target)
+    for header in request.headers().values() {
+        let name = HTTP.ascii_lower(header.name)
+        var keep = name != "host" && name != "content-length" && name != "transfer-encoding" && name != "connection"
+        if !preserve_sensitive && (name == "authorization" || name == "proxy-authorization" || name == "cookie") {
+            keep = false
+        }
+        if !preserve_body && (name == "content-type" || name == "content-encoding" || name == "content-language") {
+            keep = false
+        }
+        if keep { redirected.headers().append(header.name, header.value) }
+    }
+    if preserve_body { redirected.set_body(request.body()) }
+    return redirected
+}
+
+package func same_origin(left:HTTP.Url, right:HTTP.Url) bool {
+    return left.scheme == right.scheme && HTTP.ascii_lower(left.host) == HTTP.ascii_lower(right.host) &&
+        left.port == right.port
 }
 
 func send_tcp(url:HTTP.Url, request:HTTP.Request, options:Options) Result<HTTP.Response, HTTP.Error> {
@@ -96,6 +309,193 @@ func send_tls_connected(
 ) Result<HTTP.Response, HTTP.Error> {
     var connection = stream
     match Codec.write_request<TLS.Stream>(connection, request) {
+        failure(error) => {
+            close_tls(connection)
+            return Result<HTTP.Response, HTTP.Error>.failure(error)
+        }
+        success => {}
+    }
+    var result = Codec.read_response<TLS.Stream>(connection, options.limits, request.method() != HTTP.Method.head)
+    close_tls(connection)
+    return result
+}
+
+func download_parsed<W:IO.Writer>(
+    url:HTTP.Url,
+    request:HTTP.Request,
+    output:&W,
+    options:Options
+) Result<HTTP.Response, HTTP.Error> {
+    if options.maximum_redirects < 0 {
+        return Result<HTTP.Response, HTTP.Error>.failure(HTTP.failure(
+            HTTP.ErrorKind.redirect_limit, null, "maximum_redirects must be non-negative"
+        ))
+    }
+    var current_url = url
+    var current_request = request
+    var redirects = 0
+    while true {
+        prepare_request(current_url, current_request)
+        var result = try download_once<W>(
+            current_url,
+            current_request,
+            output,
+            options,
+            options.maximum_redirects > 0
+        )
+        if result.streamed || !result.response.is_redirect() {
+            return Result<HTTP.Response, HTTP.Error>.success(result.response)
+        }
+        var location = ""
+        if let value = result.response.location() { location = value }
+        else { return Result<HTTP.Response, HTTP.Error>.success(result.response) }
+        if redirects >= options.maximum_redirects {
+            return Result<HTTP.Response, HTTP.Error>.failure(HTTP.failure(
+                HTTP.ErrorKind.redirect_limit, location, "HTTP redirect limit exceeded"
+            ))
+        }
+        let next_url = try current_url.resolve(location)
+        if current_url.scheme == "https" && next_url.scheme == "http" && !options.allow_insecure_redirects {
+            return Result<HTTP.Response, HTTP.Error>.failure(HTTP.failure(
+                HTTP.ErrorKind.insecure_redirect, location, "HTTPS redirect to cleartext HTTP is disabled"
+            ))
+        }
+        current_request = redirect_request(current_request, result.response.status(), next_url, same_origin(current_url, next_url))
+        current_url = next_url
+        redirects++
+    }
+    panic("HTTP download redirect loop terminated unexpectedly")
+}
+
+func download_once<W:IO.Writer>(
+    url:HTTP.Url,
+    request:HTTP.Request,
+    output:&W,
+    options:Options,
+    may_follow:bool
+) Result<DownloadResult, HTTP.Error> {
+    if url.scheme == "http" {
+        var stream = try connect(url, options)
+        match Codec.write_request<TCP.Stream>(stream, request) {
+            failure(error) => {
+                close_stream(stream)
+                return Result<DownloadResult, HTTP.Error>.failure(error)
+            }
+            success => {}
+        }
+        var result = download_connected<TCP.Stream, W>(stream, request, output, options, may_follow)
+        close_stream(stream)
+        return result
+    }
+    if url.scheme == "https" {
+        match TLS.connect(url.host, url.port, TLS.ConnectOptions(
+            read_timeout_milliseconds:options.read_timeout_milliseconds,
+            write_timeout_milliseconds:options.write_timeout_milliseconds
+        )) {
+            failure(error) => {
+                return Result<DownloadResult, HTTP.Error>.failure(HTTP.failure(
+                    HTTP.ErrorKind.secure_transport, error.host, error.detail
+                ))
+            }
+            success(stream) => { return download_tls_connected<W>(stream, request, output, options, may_follow) }
+        }
+    }
+    return Result<DownloadResult, HTTP.Error>.failure(HTTP.failure(
+        HTTP.ErrorKind.unsupported_scheme, url.scheme, "HTTP supports only http and https URLs"
+    ))
+}
+
+func download_tls_connected<W:IO.Writer>(
+    stream:TLS.Stream,
+    request:HTTP.Request,
+    output:&W,
+    options:Options,
+    may_follow:bool
+) Result<DownloadResult, HTTP.Error> {
+    var connection = stream
+    match Codec.write_request<TLS.Stream>(connection, request) {
+        failure(error) => {
+            close_tls(connection)
+            return Result<DownloadResult, HTTP.Error>.failure(error)
+        }
+        success => {}
+    }
+    var result = download_connected<TLS.Stream, W>(connection, request, output, options, may_follow)
+    close_tls(connection)
+    return result
+}
+
+func download_connected<T:IO.Reader, W:IO.Writer>(
+    connection:&T,
+    request:HTTP.Request,
+    output:&W,
+    options:Options,
+    may_follow:bool
+) Result<DownloadResult, HTTP.Error> {
+    var response = try Codec.read_final_response_head<T>(connection, options.limits)
+    if may_follow && response.is_redirect() && response.location() != null {
+        return Result<DownloadResult, HTTP.Error>.success(DownloadResult(response:response, streamed:false))
+    }
+    if request.method() != HTTP.Method.head {
+        try Codec.copy_body<T, W>(connection, output, response.headers(), options.limits, true)
+    }
+    return Result<DownloadResult, HTTP.Error>.success(DownloadResult(response:response, streamed:true))
+}
+
+func send_stream_parsed<R:IO.Reader>(
+    url:HTTP.Url,
+    request:HTTP.Request,
+    input:&R,
+    content_length:int,
+    options:Options
+) Result<HTTP.Response, HTTP.Error> {
+    prepare_request(url, request)
+    if url.scheme == "http" {
+        var stream = try connect(url, options)
+        match Codec.write_request_from<TCP.Stream, R>(
+            stream, request, input, content_length, options.limits.maximum_body_bytes
+        ) {
+            failure(error) => {
+                close_stream(stream)
+                return Result<HTTP.Response, HTTP.Error>.failure(error)
+            }
+            success => {}
+        }
+        var result = Codec.read_response<TCP.Stream>(stream, options.limits, request.method() != HTTP.Method.head)
+        close_stream(stream)
+        return result
+    }
+    if url.scheme == "https" {
+        match TLS.connect(url.host, url.port, TLS.ConnectOptions(
+            read_timeout_milliseconds:options.read_timeout_milliseconds,
+            write_timeout_milliseconds:options.write_timeout_milliseconds
+        )) {
+            failure(error) => {
+                return Result<HTTP.Response, HTTP.Error>.failure(HTTP.failure(
+                    HTTP.ErrorKind.secure_transport, error.host, error.detail
+                ))
+            }
+            success(stream) => {
+                return send_stream_tls_connected<R>(stream, request, input, content_length, options)
+            }
+        }
+    }
+    return Result<HTTP.Response, HTTP.Error>.failure(HTTP.failure(
+        HTTP.ErrorKind.unsupported_scheme, url.scheme, "HTTP supports only http and https URLs"
+    ))
+}
+
+func send_stream_tls_connected<R:IO.Reader>(
+    stream:TLS.Stream,
+    request:HTTP.Request,
+    input:&R,
+    content_length:int,
+    options:Options
+) Result<HTTP.Response, HTTP.Error> {
+    var connection = stream
+    match Codec.write_request_from<TLS.Stream, R>(
+        connection, request, input, content_length, options.limits.maximum_body_bytes
+    ) {
         failure(error) => {
             close_tls(connection)
             return Result<HTTP.Response, HTTP.Error>.failure(error)

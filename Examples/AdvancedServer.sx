@@ -1,0 +1,67 @@
+use HTTP
+use HTTP.Server
+use STD.Network
+
+func respond(request:@HTTP.Request, body:Server.IncomingBody) Result<HTTP.Response, HTTP.Error> {
+    if request.path() == "/redirect" {
+        try body.discard()
+        var response = HTTP.Response(302, "Found")
+        response.headers().set("Location", "/final")
+        return Result<HTTP.Response, HTTP.Error>.success(response)
+    }
+    if request.path() == "/final" {
+        try body.discard()
+        return Result<HTTP.Response, HTTP.Error>.success(HTTP.Response.text(200, "redirected"))
+    }
+    if request.path() == "/query" {
+        try body.discard()
+        let name = try request.query_parameter("name")
+        if let value = name {
+            return Result<HTTP.Response, HTTP.Error>.success(HTTP.Response.text(200, value))
+        }
+        return Result<HTTP.Response, HTTP.Error>.success(HTTP.Response.text(400, "missing name"))
+    }
+    if request.path() == "/echo" {
+        let bytes = try body.read_all()
+        var response = HTTP.Response.bytes(200, bytes, "application/octet-stream")
+        return Result<HTTP.Response, HTTP.Error>.success(response)
+    }
+    if request.path() == "/upload" {
+        var count = 0
+        while !body.finished() {
+            let bytes = try body.read(97)
+            count += bytes.count()
+        }
+        return Result<HTTP.Response, HTTP.Error>.success(HTTP.Response.text(200, "$(count)"))
+    }
+    if request.path() == "/download" {
+        try body.discard()
+        var text = ""
+        var index = 0
+        while index < 4_096 { text += "x"; index++ }
+        return Result<HTTP.Response, HTTP.Error>.success(HTTP.Response.text(200, text))
+    }
+    try body.discard()
+    return Result<HTTP.Response, HTTP.Error>.success(HTTP.Response.text(404, "Not found"))
+}
+
+func handle(request:@HTTP.Request, body:Server.IncomingBody) HTTP.Response {
+    match respond(request, body) {
+        success(response) => { return response }
+        failure(error) => { return HTTP.Response.text(400, error.detail) }
+    }
+}
+
+func run() Result<void, HTTP.Error> {
+    var server = try Server.listen("127.0.0.1", 18081)
+    let endpoint = try server.local_endpoint()
+    print("Listening on http://$(Network.format_endpoint(endpoint))")
+    return server.serve_stream(handle)
+}
+
+func main() {
+    match run() {
+        success => {}
+        failure(error) => { panic(error.detail) }
+    }
+}

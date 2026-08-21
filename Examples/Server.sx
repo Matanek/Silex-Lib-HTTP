@@ -4,10 +4,10 @@ use HTTP.Server
 use STD.Network
 
 func handle(request:@HTTP.Request) HTTP.Response {
-    if request.target() == "/api/health" {
+    if request.path() == "/api/health" {
         return HTTP.Response.text(200, "{\"status\":\"ok\"}", "application/json; charset=utf-8")
     }
-    if request.target() == "/" {
+    if request.path() == "/" {
         var page = HTML.html_document("Silex HTTP")
         var body = page.elements("body")[0]
         body.append_element("h1").append_text("Served by Silex")

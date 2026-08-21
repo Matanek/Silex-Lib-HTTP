@@ -1,4 +1,5 @@
 use STD.Text.UTF8
+use STD.Network
 
 public enum Method {
     get
@@ -18,6 +19,11 @@ public struct Header {
     let value:str
 }
 
+public struct QueryParameter {
+    let name:str
+    let value:str
+}
+
 public enum ErrorKind {
     invalid_url
     unsupported_scheme
@@ -27,6 +33,11 @@ public enum ErrorKind {
     header_limit
     body_limit
     unsupported_transfer
+    unsupported_upgrade
+    redirect_limit
+    insecure_redirect
+    http_status
+    body_stream
     invalid_text
     closed
 }
@@ -41,6 +52,7 @@ public struct Limits {
     let maximum_header_bytes:int
     let maximum_headers:int
     let maximum_body_bytes:int
+    let maximum_informational_responses:int
 }
 
 public struct Url {
@@ -59,6 +71,12 @@ public struct Url {
         }
         return name + ":" + decimal(self.port as int)
     }
+
+    func path() str { return target_path(self.target) }
+    func query() str? { return target_query(self.target) }
+    func query_parameters() Result<QueryParameter[], Error> { return parse_query(self.target) }
+    func query_parameter(name:str) Result<str?, Error> { return find_query_parameter(self.target, name) }
+    func resolve(location:str) Result<Url, Error> { return resolve_url(self, location) }
 }
 
 public class Headers {
@@ -119,20 +137,34 @@ public class Request {
     private let request_target:str
     private var request_headers:Headers
     private var request_body:uint8[]
+    private var request_peer:Network.Endpoint?
 
     init(method:Method, target:str) {
-        if target == "" { panic("HTTP request target cannot be empty") }
+        if !valid_method_text(method_text(method)) { panic("HTTP request method contains an invalid byte") }
+        if !valid_request_target(target) { panic("HTTP request target contains an invalid byte") }
         self.request_method = method
         self.request_target = target
         self.request_headers = Headers()
         self.request_body = []
+        self.request_peer = null
     }
 
     static func get(target:str) Request { return Request(Method.get, target) }
+    static func head(target:str) Request { return Request(Method.head, target) }
     static func post(target:str) Request { return Request(Method.post, target) }
+    static func put(target:str) Request { return Request(Method.put, target) }
+    static func patch(target:str) Request { return Request(Method.patch, target) }
+    static func delete(target:str) Request { return Request(Method.delete, target) }
 
     func method() Method { return self.request_method }
     func target() str { return self.request_target }
+    func path() str { return target_path(self.request_target) }
+    func query() str? { return target_query(self.request_target) }
+    func query_parameters() Result<QueryParameter[], Error> { return parse_query(self.request_target) }
+    func query_parameter(name:str) Result<str?, Error> {
+        return find_query_parameter(self.request_target, name)
+    }
+    func peer() Network.Endpoint? { return self.request_peer }
     func headers() Headers { return self.request_headers }
     func body() uint8[] { return self.request_body }
 
@@ -146,6 +178,7 @@ public class Request {
     func text() Result<str, Error> { return decode_text(self.request_body, "HTTP request body") }
 
     package func replace_headers(headers:Headers) { self.request_headers = headers }
+    package func set_peer(endpoint:Network.Endpoint) { self.request_peer = endpoint }
 }
 
 public class Response {
@@ -156,6 +189,7 @@ public class Response {
 
     init(status:int, reason:str = "") {
         if status < 100 || status > 999 { panic("HTTP response status must have three digits") }
+        if !valid_reason(reason) { panic("HTTP response reason contains a forbidden control byte") }
         self.response_status = status
         self.response_reason = reason
         self.response_headers = Headers()
@@ -185,7 +219,21 @@ public class Response {
     func headers() Headers { return self.response_headers }
     func body() uint8[] { return self.response_body }
     func is_success() bool { return self.response_status >= 200 && self.response_status < 300 }
+    func is_redirect() bool {
+        return self.response_status == 301 || self.response_status == 302 || self.response_status == 303 ||
+            self.response_status == 307 || self.response_status == 308
+    }
+    func location() str? { return self.response_headers.get("Location") }
     func text() Result<str, Error> { return decode_text(self.response_body, "HTTP response body") }
+
+    func require_success() Result<void, Error> {
+        if self.is_success() { return Result<void, Error>.success() }
+        return Result<void, Error>.failure(failure(
+            ErrorKind.http_status,
+            decimal(self.response_status),
+            "HTTP response status is not successful"
+        ))
+    }
 
     package func replace_headers(headers:Headers) { self.response_headers = headers }
     package func replace_body(body:uint8[]) { self.response_body = body }
@@ -195,8 +243,72 @@ public func default_limits() Limits {
     return Limits(
         maximum_header_bytes:64 * 1024,
         maximum_headers:128,
-        maximum_body_bytes:16 * 1024 * 1024
+        maximum_body_bytes:16 * 1024 * 1024,
+        maximum_informational_responses:8
     )
+}
+
+public func encode_query_component(value:str) str {
+    var result = ""
+    for byte in UTF8.bytes(value) {
+        if query_unreserved(byte) { result += text_from_byte(byte) }
+        else {
+            result += "%"
+            result += text_from_byte(hex_upper((byte / 16) as int))
+            result += text_from_byte(hex_upper((byte % 16) as int))
+        }
+    }
+    return result
+}
+
+public func decode_query_component(value:str) Result<str, Error> {
+    let bytes = UTF8.bytes(value)
+    var decoded:uint8[] = []
+    var index = 0
+    while index < bytes.count() {
+        if bytes[index] == 37 {
+            if index + 2 >= bytes.count() {
+                return Result<str, Error>.failure(failure(
+                    ErrorKind.invalid_url, value, "query percent escape is incomplete"
+                ))
+            }
+            let high = hex_value(bytes[index + 1])
+            let low = hex_value(bytes[index + 2])
+            if high < 0 || low < 0 {
+                return Result<str, Error>.failure(failure(
+                    ErrorKind.invalid_url, value, "query percent escape is not hexadecimal"
+                ))
+            }
+            decoded.append((high * 16 + low) as uint8)
+            index += 3
+            continue
+        }
+        if bytes[index] == 43 { decoded.append(32 as uint8) }
+        else { decoded.append(bytes[index]) }
+        index++
+    }
+    if decoded.is_empty() { return Result<str, Error>.success("") }
+    match UTF8.decode(@decoded[0:decoded.count()]) {
+        success(text) => { return Result<str, Error>.success(text) }
+        failure(error) => {
+            return Result<str, Error>.failure(failure(
+                ErrorKind.invalid_url,
+                value,
+                "decoded query is not valid UTF-8 at byte $(error.byte_offset)"
+            ))
+        }
+    }
+}
+
+public func encode_query(parameters:QueryParameter[]) str {
+    var result = ""
+    for parameter in parameters {
+        if result != "" { result += "&" }
+        result += encode_query_component(parameter.name)
+        result += "="
+        result += encode_query_component(parameter.value)
+    }
+    return result
 }
 
 public func method_text(method:Method) str {
@@ -312,6 +424,13 @@ func parse_url(value:str) Result<Url, Error> {
         return Result<Url, Error>.failure(failure(ErrorKind.invalid_url, value, "URL host is empty"))
     }
     let authority = byte_slice(bytes, authority_start, authority_end)
+    for byte in UTF8.bytes(authority) {
+        if byte <= 32 || byte == 127 || byte == 92 {
+            return Result<Url, Error>.failure(failure(
+                ErrorKind.invalid_url, value, "URL authority contains an invalid byte"
+            ))
+        }
+    }
     if contains_byte(authority, 64) {
         return Result<Url, Error>.failure(failure(ErrorKind.invalid_url, value, "userinfo is not supported in HTTP URLs"))
     }
@@ -371,6 +490,135 @@ func parse_url(value:str) Result<Url, Error> {
     return Result<Url, Error>.success(Url(scheme:scheme, host:host, port:port, target:target))
 }
 
+func resolve_url(base:Url, location:str) Result<Url, Error> {
+    let trimmed = trim(location)
+    if trimmed == "" {
+        return Result<Url, Error>.failure(failure(
+            ErrorKind.invalid_url, location, "redirect location is empty"
+        ))
+    }
+    if starts_with_text(ascii_lower(trimmed), "http://") || starts_with_text(ascii_lower(trimmed), "https://") {
+        return Url.parse(trimmed)
+    }
+    let prefix = base.scheme + "://" + base.authority()
+    if starts_with_text(trimmed, "//") { return Url.parse(base.scheme + ":" + trimmed) }
+    if starts_with_text(trimmed, "/") { return Url.parse(prefix + trimmed) }
+    if starts_with_text(trimmed, "?") { return Url.parse(prefix + base.path() + trimmed) }
+    if starts_with_text(trimmed, "#") { return Url.parse(prefix + base.target + trimmed) }
+    let path = base.path()
+    let bytes = UTF8.bytes(path)
+    var slash = bytes.count() - 1
+    while slash >= 0 && bytes[slash] != 47 { slash-- }
+    var directory = "/"
+    if slash >= 0 { directory = byte_slice(bytes, 0, slash + 1) }
+    return Url.parse(prefix + normalize_path(directory + trimmed))
+}
+
+func target_path(target:str) str {
+    let bytes = UTF8.bytes(target)
+    var end = bytes.count()
+    var index = 0
+    while index < bytes.count() {
+        if bytes[index] == 63 || bytes[index] == 35 { end = index; break }
+        index++
+    }
+    if end == 0 { return "/" }
+    return byte_slice(bytes, 0, end)
+}
+
+func target_query(target:str) str? {
+    let bytes = UTF8.bytes(target)
+    var start = -1
+    var end = bytes.count()
+    var index = 0
+    while index < bytes.count() {
+        if bytes[index] == 63 && start < 0 { start = index + 1 }
+        elif bytes[index] == 35 { end = index; break }
+        index++
+    }
+    if start < 0 { return null }
+    return byte_slice(bytes, start, end)
+}
+
+func parse_query(target:str) Result<QueryParameter[], Error> {
+    var result:QueryParameter[] = []
+    if let query = target_query(target) {
+        if query == "" { return Result<QueryParameter[], Error>.success(result) }
+        let bytes = UTF8.bytes(query)
+        var start = 0
+        var index = 0
+        while index <= bytes.count() {
+            if index == bytes.count() || bytes[index] == 38 {
+                let item = byte_slice(bytes, start, index)
+                let item_bytes = UTF8.bytes(item)
+                var equals = -1
+                var cursor = 0
+                while cursor < item_bytes.count() {
+                    if item_bytes[cursor] == 61 { equals = cursor; break }
+                    cursor++
+                }
+                var raw_name = item
+                var raw_value = ""
+                if equals >= 0 {
+                    raw_name = byte_slice(item_bytes, 0, equals)
+                    raw_value = byte_slice(item_bytes, equals + 1, item_bytes.count())
+                }
+                let name = try decode_query_component(raw_name)
+                let value = try decode_query_component(raw_value)
+                result.append(QueryParameter(name:name, value:value))
+                start = index + 1
+            }
+            index++
+        }
+    }
+    return Result<QueryParameter[], Error>.success(result)
+}
+
+func find_query_parameter(target:str, expected:str) Result<str?, Error> {
+    let parameters = try parse_query(target)
+    for parameter in parameters {
+        if parameter.name == expected { return Result<str?, Error>.success(parameter.value) }
+    }
+    return Result<str?, Error>.success(null)
+}
+
+func normalize_path(value:str) str {
+    let bytes = UTF8.bytes(value)
+    var end = bytes.count()
+    var suffix = ""
+    var index = 0
+    while index < bytes.count() {
+        if bytes[index] == 63 || bytes[index] == 35 {
+            end = index
+            suffix = byte_slice(bytes, index, bytes.count())
+            break
+        }
+        index++
+    }
+    var segments:str[] = []
+    var start = 0
+    index = 0
+    while index <= end {
+        if index == end || bytes[index] == 47 {
+            let segment = byte_slice(bytes, start, index)
+            if segment == ".." {
+                if !segments.is_empty() { segments.take_last() }
+            } elif segment != "" && segment != "." { segments.append(segment) }
+            start = index + 1
+        }
+        index++
+    }
+    var result = "/"
+    index = 0
+    while index < segments.count() {
+        if index > 0 { result += "/" }
+        result += segments[index]
+        index++
+    }
+    if end > 0 && bytes[end - 1] == 47 && result != "/" { result += "/" }
+    return result + suffix
+}
+
 func parse_port(value:str, subject:str) Result<uint16, Error> {
     let bytes = UTF8.bytes(value)
     if bytes.count() == 0 {
@@ -399,8 +647,33 @@ func require_header(name:str, value:str) {
         if !header_name_byte(byte) { panic("invalid HTTP header name '$(name)'") }
     }
     for byte in UTF8.bytes(value) {
-        if byte == 0 || byte == 10 || byte == 13 { panic("HTTP header value contains a forbidden control character") }
+        if (byte < 32 && byte != 9) || byte == 127 {
+            panic("HTTP header value contains a forbidden control character")
+        }
     }
+}
+
+package func valid_method_text(value:str) bool {
+    let bytes = UTF8.bytes(value)
+    if bytes.is_empty() { return false }
+    for byte in bytes { if !header_name_byte(byte) { return false } }
+    return true
+}
+
+package func valid_request_target(value:str) bool {
+    let bytes = UTF8.bytes(value)
+    if bytes.is_empty() { return false }
+    for byte in bytes {
+        if byte <= 32 || byte == 127 { return false }
+    }
+    return true
+}
+
+func valid_reason(value:str) bool {
+    for byte in UTF8.bytes(value) {
+        if (byte < 32 && byte != 9) || byte == 127 { return false }
+    }
+    return true
 }
 
 package func header_name_byte(byte:uint8) bool {
@@ -423,6 +696,40 @@ func contains_byte(value:str, expected:uint8) bool {
     return false
 }
 
+func starts_with_text(value:str, prefix:str) bool {
+    let bytes = UTF8.bytes(value)
+    let expected = UTF8.bytes(prefix)
+    if bytes.count() < expected.count() { return false }
+    var index = 0
+    while index < expected.count() {
+        if bytes[index] != expected[index] { return false }
+        index++
+    }
+    return true
+}
+
+func query_unreserved(byte:uint8) bool {
+    return (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) ||
+        (byte >= 48 && byte <= 57) || byte == 45 || byte == 46 || byte == 95 || byte == 126
+}
+
+func hex_upper(value:int) uint8 {
+    if value < 10 { return (48 + value) as uint8 }
+    return (55 + value) as uint8
+}
+
+func hex_value(byte:uint8) int {
+    if byte >= 48 && byte <= 57 { return (byte - 48) as int }
+    if byte >= 65 && byte <= 70 { return (byte - 55) as int }
+    if byte >= 97 && byte <= 102 { return (byte - 87) as int }
+    return -1
+}
+
+func text_from_byte(byte:uint8) str {
+    var bytes:uint8[] = [byte]
+    return text_from_bytes(bytes)
+}
+
 func reason_phrase(status:int) str {
     if status == 200 { return "OK" }
     if status == 201 { return "Created" }
@@ -434,6 +741,8 @@ func reason_phrase(status:int) str {
     if status == 404 { return "Not Found" }
     if status == 405 { return "Method Not Allowed" }
     if status == 413 { return "Content Too Large" }
+    if status == 431 { return "Request Header Fields Too Large" }
     if status == 500 { return "Internal Server Error" }
+    if status == 501 { return "Not Implemented" }
     return ""
 }

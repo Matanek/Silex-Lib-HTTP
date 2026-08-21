@@ -2,26 +2,38 @@ use HTTP
 use STD.IO
 use STD.Text.UTF8
 
-struct BodyFraming {
+package struct BodyFraming {
     let kind:int
     let length:int
 }
 
 package func read_request<T:IO.Reader>(reader:&T, limits:HTTP.Limits) Result<HTTP.Request, HTTP.Error> {
+    var request = try read_request_head<T>(reader, limits)
+    var body = try read_body<T>(reader, request.headers(), limits, false)
+    request.set_body(body)
+    return Result<HTTP.Request, HTTP.Error>.success(request)
+}
+
+package func read_request_head<T:IO.Reader>(reader:&T, limits:HTTP.Limits) Result<HTTP.Request, HTTP.Error> {
     var remaining_headers = limits.maximum_header_bytes
     var start = try read_line<T>(reader, remaining_headers, "HTTP request line")
     let parts = split_spaces(start)
     if parts.count() != 3 || parts[0] == "" || parts[1] == "" || parts[2] != "HTTP/1.1" {
         return fail_request(HTTP.ErrorKind.malformed_message, "request line must be METHOD target HTTP/1.1")
     }
-    if !valid_method(parts[0]) {
+    if !HTTP.valid_method_text(parts[0]) {
         return fail_request(HTTP.ErrorKind.malformed_message, "request method contains an invalid byte")
     }
+    if !HTTP.valid_request_target(parts[1]) {
+        return fail_request(HTTP.ErrorKind.malformed_message, "request target contains an invalid byte")
+    }
     var headers = try read_headers<T>(reader, limits, remaining_headers)
-    var body = try read_body<T>(reader, headers, limits, false)
+    let hosts = headers.get_all("Host")
+    if hosts.count() != 1 || HTTP.trim(hosts[0]) == "" {
+        return fail_request(HTTP.ErrorKind.malformed_message, "HTTP/1.1 request requires exactly one non-empty Host header")
+    }
     var request = HTTP.Request(HTTP.parse_method(parts[0]), parts[1])
     request.replace_headers(headers)
-    request.set_body(body)
     return Result<HTTP.Request, HTTP.Error>.success(request)
 }
 
@@ -30,14 +42,26 @@ package func read_response<T:IO.Reader>(
     limits:HTTP.Limits,
     expect_body:bool
 ) Result<HTTP.Response, HTTP.Error> {
+    var response = try read_final_response_head<T>(reader, limits)
+    if expect_body && !body_forbidden(response.status()) {
+        var body = try read_body<T>(reader, response.headers(), limits, true)
+        response.replace_body(body)
+    }
+    return Result<HTTP.Response, HTTP.Error>.success(response)
+}
+
+package func read_response_head<T:IO.Reader>(reader:&T, limits:HTTP.Limits) Result<HTTP.Response, HTTP.Error> {
     var remaining_headers = limits.maximum_header_bytes
     var start = try read_line<T>(reader, remaining_headers, "HTTP status line")
     if !starts_with(start, "HTTP/1.1 ") && !starts_with(start, "HTTP/1.0 ") {
         return fail_response(HTTP.ErrorKind.malformed_message, "status line must begin with HTTP/1.1 or HTTP/1.0")
     }
     let bytes = UTF8.bytes(start)
-    if bytes.count() < 12 || bytes[9] < 48 || bytes[9] > 57 || bytes[10] < 48 || bytes[10] > 57 || bytes[11] < 48 || bytes[11] > 57 {
+    if bytes.count() < 13 || bytes[9] < 48 || bytes[9] > 57 || bytes[10] < 48 || bytes[10] > 57 || bytes[11] < 48 || bytes[11] > 57 {
         return fail_response(HTTP.ErrorKind.malformed_message, "response status must contain three digits")
+    }
+    if bytes[12] != 32 {
+        return fail_response(HTTP.ErrorKind.malformed_message, "response status must be followed by a space")
     }
     let status = ((bytes[9] - 48) as int) * 100 + ((bytes[10] - 48) as int) * 10 + (bytes[11] - 48) as int
     var reason = ""
@@ -45,9 +69,43 @@ package func read_response<T:IO.Reader>(
     var headers = try read_headers<T>(reader, limits, remaining_headers)
     var response = HTTP.Response(status, reason)
     response.replace_headers(headers)
-    if expect_body && !body_forbidden(status) {
-        var body = try read_body<T>(reader, headers, limits, true)
-        response.replace_body(body)
+    return Result<HTTP.Response, HTTP.Error>.success(response)
+}
+
+package func read_final_response_head<T:IO.Reader>(
+    reader:&T,
+    limits:HTTP.Limits
+) Result<HTTP.Response, HTTP.Error> {
+    if limits.maximum_informational_responses < 0 {
+        return fail_response(HTTP.ErrorKind.header_limit, "maximum_informational_responses must be non-negative")
+    }
+    var informational = 0
+    while true {
+        var response = try read_response_head<T>(reader, limits)
+        if response.status() == 101 {
+            return fail_response(HTTP.ErrorKind.unsupported_upgrade, "HTTP protocol upgrades are not supported")
+        }
+        if response.status() >= 100 && response.status() < 200 {
+            informational++
+            if informational > limits.maximum_informational_responses {
+                return fail_response(HTTP.ErrorKind.header_limit, "HTTP response exceeds maximum_informational_responses")
+            }
+            continue
+        }
+        return Result<HTTP.Response, HTTP.Error>.success(response)
+    }
+    panic("HTTP response head parser terminated unexpectedly")
+}
+
+package func read_response_to<T:IO.Reader, W:IO.Writer>(
+    reader:&T,
+    output:&W,
+    limits:HTTP.Limits,
+    expect_body:bool
+) Result<HTTP.Response, HTTP.Error> {
+    var response = try read_final_response_head<T>(reader, limits)
+    if expect_body && !body_forbidden(response.status()) {
+        try copy_body<T, W>(reader, output, response.headers(), limits, true)
     }
     return Result<HTTP.Response, HTTP.Error>.success(response)
 }
@@ -62,6 +120,39 @@ package func write_request<T:IO.Writer>(writer:&T, request:@HTTP.Request) Result
     append_text(bytes, "Connection: close\r\n\r\n")
     for byte in body { bytes.append(byte) }
     return write_bytes<T>(writer, bytes)
+}
+
+package func write_request_from<T:IO.Writer, R:IO.Reader>(
+    writer:&T,
+    request:@HTTP.Request,
+    input:&R,
+    content_length:int,
+    maximum_body_bytes:int
+) Result<void, HTTP.Error> {
+    if content_length < 0 {
+        return Result<void, HTTP.Error>.failure(HTTP.failure(
+            HTTP.ErrorKind.body_stream, null, "streaming request content length must be non-negative"
+        ))
+    }
+    if maximum_body_bytes < 0 || content_length > maximum_body_bytes {
+        return Result<void, HTTP.Error>.failure(HTTP.failure(
+            HTTP.ErrorKind.body_limit, null, "streaming request exceeds maximum_body_bytes"
+        ))
+    }
+    let buffered_body = request.body()
+    if buffered_body.count() != 0 {
+        return Result<void, HTTP.Error>.failure(HTTP.failure(
+            HTTP.ErrorKind.body_stream, null, "streaming request must not also contain a buffered body"
+        ))
+    }
+    var bytes:uint8[] = []
+    append_text(bytes, HTTP.method_text(request.method()) + " " + request.target() + " HTTP/1.1\r\n")
+    var headers = request.headers()
+    append_headers(bytes, headers)
+    append_text(bytes, "Content-Length: " + HTTP.decimal(content_length) + "\r\n")
+    append_text(bytes, "Connection: close\r\n\r\n")
+    try write_bytes<T>(writer, bytes)
+    return copy_exact<R, T>(input, writer, content_length)
 }
 
 package func write_response<T:IO.Writer>(
@@ -108,49 +199,13 @@ func read_headers<T:IO.Reader>(
                 "HTTP message exceeds maximum_headers"
             ))
         }
-        let bytes = UTF8.bytes(line)
-        var colon = -1
-        var index = 0
-        while index < bytes.count() {
-            if bytes[index] == 58 { colon = index; break }
-            index++
-        }
-        if colon <= 0 {
-            return Result<HTTP.Headers, HTTP.Error>.failure(HTTP.failure(
-                HTTP.ErrorKind.malformed_message,
-                null,
-                "HTTP header line is missing a field-name separator"
-            ))
-        }
-        index = 0
-        while index < colon {
-            if !HTTP.header_name_byte(bytes[index]) {
-                return Result<HTTP.Headers, HTTP.Error>.failure(HTTP.failure(
-                    HTTP.ErrorKind.malformed_message,
-                    null,
-                    "HTTP header name contains an invalid byte"
-                ))
-            }
-            index++
-        }
-        index = colon + 1
-        while index < bytes.count() {
-            let byte = bytes[index]
-            if (byte < 32 && byte != 9) || byte == 127 {
-                return Result<HTTP.Headers, HTTP.Error>.failure(HTTP.failure(
-                    HTTP.ErrorKind.malformed_message,
-                    null,
-                    "HTTP header value contains a forbidden control byte"
-                ))
-            }
-            index++
-        }
-        headers.append(bytes_text(bytes, 0, colon), HTTP.trim(bytes_text(bytes, colon + 1, bytes.count())))
+        let header = try parse_header_line(line)
+        headers.append(header.name, header.value)
     }
     panic("HTTP header parser terminated unexpectedly")
 }
 
-func read_body<T:IO.Reader>(
+package func read_body<T:IO.Reader>(
     reader:&T,
     headers:HTTP.Headers,
     limits:HTTP.Limits,
@@ -171,7 +226,33 @@ func read_body<T:IO.Reader>(
     return Result<uint8[], HTTP.Error>.success([])
 }
 
-func body_framing(headers:HTTP.Headers) Result<BodyFraming, HTTP.Error> {
+package func copy_body<T:IO.Reader, W:IO.Writer>(
+    reader:&T,
+    output:&W,
+    headers:HTTP.Headers,
+    limits:HTTP.Limits,
+    close_delimited:bool
+) Result<void, HTTP.Error> {
+    if limits.maximum_body_bytes < 0 {
+        return Result<void, HTTP.Error>.failure(HTTP.failure(
+            HTTP.ErrorKind.body_limit, null, "maximum_body_bytes must be non-negative"
+        ))
+    }
+    let framing = try body_framing(headers)
+    if framing.kind == 1 {
+        if framing.length > limits.maximum_body_bytes {
+            return Result<void, HTTP.Error>.failure(HTTP.failure(
+                HTTP.ErrorKind.body_limit, null, "HTTP body exceeds maximum_body_bytes"
+            ))
+        }
+        return copy_exact<T, W>(reader, output, framing.length)
+    }
+    if framing.kind == 2 { return copy_chunked<T, W>(reader, output, limits) }
+    if close_delimited { return copy_to_end<T, W>(reader, output, limits.maximum_body_bytes) }
+    return Result<void, HTTP.Error>.success()
+}
+
+package func body_framing(headers:HTTP.Headers) Result<BodyFraming, HTTP.Error> {
     let transfer_values = headers.get_all("Transfer-Encoding")
     let length_values = headers.get_all("Content-Length")
     if transfer_values.count() > 0 && length_values.count() > 0 {
@@ -234,6 +315,11 @@ func read_chunked<T:IO.Reader>(reader:&T, limits:HTTP.Limits) Result<uint8[], HT
                 if trailer_count > limits.maximum_headers {
                     return fail_bytes(HTTP.ErrorKind.header_limit, "HTTP trailers exceed maximum_headers")
                 }
+                let header = try parse_header_line(trailer)
+                let name = HTTP.ascii_lower(header.name)
+                if name == "content-length" || name == "transfer-encoding" || name == "host" {
+                    return fail_bytes(HTTP.ErrorKind.malformed_message, "HTTP trailer contains a forbidden framing field")
+                }
             }
         }
         if size > limits.maximum_body_bytes - result.count() {
@@ -249,7 +335,119 @@ func read_chunked<T:IO.Reader>(reader:&T, limits:HTTP.Limits) Result<uint8[], HT
     panic("HTTP chunk parser terminated unexpectedly")
 }
 
-func read_count<T:IO.Reader>(reader:&T, count:int) Result<uint8[], HTTP.Error> {
+func copy_chunked<T:IO.Reader, W:IO.Writer>(
+    reader:&T,
+    output:&W,
+    limits:HTTP.Limits
+) Result<void, HTTP.Error> {
+    var total = 0
+    var metadata_budget = limits.maximum_header_bytes
+    while true {
+        let line = try read_line<T>(reader, metadata_budget, "HTTP chunk size")
+        let size = parse_chunk_size(line)
+        if size < 0 {
+            return Result<void, HTTP.Error>.failure(HTTP.failure(
+                HTTP.ErrorKind.malformed_message, null, "HTTP chunk size is not hexadecimal"
+            ))
+        }
+        if size == 0 {
+            var trailer_count = 0
+            while true {
+                let trailer = try read_line<T>(reader, metadata_budget, "HTTP trailer")
+                if trailer == "" { return Result<void, HTTP.Error>.success() }
+                trailer_count++
+                if trailer_count > limits.maximum_headers {
+                    return Result<void, HTTP.Error>.failure(HTTP.failure(
+                        HTTP.ErrorKind.header_limit, null, "HTTP trailers exceed maximum_headers"
+                    ))
+                }
+                let header = try parse_header_line(trailer)
+                let name = HTTP.ascii_lower(header.name)
+                if name == "content-length" || name == "transfer-encoding" || name == "host" {
+                    return Result<void, HTTP.Error>.failure(HTTP.failure(
+                        HTTP.ErrorKind.malformed_message, null, "HTTP trailer contains a forbidden framing field"
+                    ))
+                }
+            }
+        }
+        if size > limits.maximum_body_bytes - total {
+            return Result<void, HTTP.Error>.failure(HTTP.failure(
+                HTTP.ErrorKind.body_limit, null, "HTTP chunked body exceeds maximum_body_bytes"
+            ))
+        }
+        try copy_exact<T, W>(reader, output, size)
+        total += size
+        let ending = try read_count<T>(reader, 2)
+        if ending[0] != 13 || ending[1] != 10 {
+            return Result<void, HTTP.Error>.failure(HTTP.failure(
+                HTTP.ErrorKind.malformed_message, null, "HTTP chunk is not followed by CRLF"
+            ))
+        }
+    }
+    panic("HTTP chunk stream terminated unexpectedly")
+}
+
+func copy_exact<R:IO.Reader, W:IO.Writer>(
+    reader:&R,
+    output:&W,
+    count:int
+) Result<void, HTTP.Error> {
+    var remaining = count
+    while remaining > 0 {
+        var requested = remaining
+        if requested > 256 { requested = 256 }
+        let bytes = try read_count<R>(reader, requested)
+        try write_stream_bytes<W>(output, bytes)
+        remaining -= bytes.count()
+    }
+    return Result<void, HTTP.Error>.success()
+}
+
+func copy_to_end<R:IO.Reader, W:IO.Writer>(
+    reader:&R,
+    output:&W,
+    maximum:int
+) Result<void, HTTP.Error> {
+    var total = 0
+    var buffer:uint8[] = []
+    while true {
+        match read_byte<R>(reader) {
+            failure(error) => { return Result<void, HTTP.Error>.failure(error) }
+            success(value) => {
+                if value == null {
+                    try write_stream_bytes<W>(output, buffer)
+                    return Result<void, HTTP.Error>.success()
+                }
+                if total >= maximum {
+                    return Result<void, HTTP.Error>.failure(HTTP.failure(
+                        HTTP.ErrorKind.body_limit, null, "close-delimited HTTP body exceeds maximum_body_bytes"
+                    ))
+                }
+                if let byte = value { buffer.append(byte) }
+                total++
+                if buffer.count() == 256 {
+                    try write_stream_bytes<W>(output, buffer)
+                    buffer = []
+                }
+            }
+        }
+    }
+    panic("HTTP body stream terminated unexpectedly")
+}
+
+func write_stream_bytes<W:IO.Writer>(output:&W, bytes:uint8[]) Result<void, HTTP.Error> {
+    if bytes.count() == 0 { return Result<void, HTTP.Error>.success() }
+    match IO.write_all<W>(output, @bytes[0:bytes.count()]) {
+        success => { return Result<void, HTTP.Error>.success() }
+        failure(error) => {
+            return Result<void, HTTP.Error>.failure(HTTP.failure(
+                HTTP.ErrorKind.body_stream, error.subject, error.detail
+            ))
+        }
+    }
+}
+
+package func read_count<T:IO.Reader>(reader:&T, count:int) Result<uint8[], HTTP.Error> {
     var result:uint8[] = []
     var index = 0
     while index < count {
@@ -282,7 +480,7 @@ func read_to_end<T:IO.Reader>(reader:&T, maximum:int) Result<uint8[], HTTP.Error
     panic("HTTP close-delimited body reader terminated unexpectedly")
 }
 
-func read_line<T:IO.Reader>(reader:&T, remaining:&int, subject:str) Result<str, HTTP.Error> {
+package func read_line<T:IO.Reader>(reader:&T, remaining:&int, subject:str) Result<str, HTTP.Error> {
     var bytes:uint8[] = []
     while true {
         if remaining <= 0 {
@@ -381,19 +579,56 @@ func split_spaces(value:str) str[] {
     return result
 }
 
+package func parse_header_line(line:str) Result<HTTP.Header, HTTP.Error> {
+    let bytes = UTF8.bytes(line)
+    var colon = -1
+    var index = 0
+    while index < bytes.count() {
+        if bytes[index] == 58 { colon = index; break }
+        index++
+    }
+    if colon <= 0 {
+        return Result<HTTP.Header, HTTP.Error>.failure(HTTP.failure(
+            HTTP.ErrorKind.malformed_message,
+            null,
+            "HTTP header line is missing a field-name separator"
+        ))
+    }
+    index = 0
+    while index < colon {
+        if !HTTP.header_name_byte(bytes[index]) {
+            return Result<HTTP.Header, HTTP.Error>.failure(HTTP.failure(
+                HTTP.ErrorKind.malformed_message,
+                null,
+                "HTTP header name contains an invalid byte"
+            ))
+        }
+        index++
+    }
+    index = colon + 1
+    while index < bytes.count() {
+        let byte = bytes[index]
+        if (byte < 32 && byte != 9) || byte == 127 {
+            return Result<HTTP.Header, HTTP.Error>.failure(HTTP.failure(
+                HTTP.ErrorKind.malformed_message,
+                null,
+                "HTTP header value contains a forbidden control byte"
+            ))
+        }
+        index++
+    }
+    return Result<HTTP.Header, HTTP.Error>.success(HTTP.Header(
+        name:bytes_text(bytes, 0, colon),
+        value:HTTP.trim(bytes_text(bytes, colon + 1, bytes.count()))
+    ))
+}
+
 func bytes_text(bytes:uint8[], start:int, end:int) str {
     if start >= end { return "" }
     var result:uint8[] = []
     var index = start
     while index < end { result.append(bytes[index]); index++ }
     return HTTP.text_from_bytes(result)
-}
-
-func valid_method(value:str) bool {
-    let bytes = UTF8.bytes(value)
-    if bytes.count() == 0 { return false }
-    for byte in bytes { if !HTTP.header_name_byte(byte) { return false } }
-    return true
 }
 
 func parse_decimal(value:str) int {
@@ -408,7 +643,7 @@ func parse_decimal(value:str) int {
     return result
 }
 
-func parse_chunk_size(value:str) int {
+package func parse_chunk_size(value:str) int {
     let bytes = UTF8.bytes(value)
     var end = 0
     while end < bytes.count() && bytes[end] != 59 { end++ }

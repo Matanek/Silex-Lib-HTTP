@@ -1,4 +1,5 @@
 use HTTP
+use HTTP.Client
 use HTTP.Codec
 use STD.Error
 use STD.IO
@@ -38,6 +39,42 @@ class MemoryStream:IO.Reader, IO.Writer {
             failure(error) => { panic("test output is not UTF-8") }
         }
     }
+}
+
+func require_url(result:Result<HTTP.Url, HTTP.Error>) HTTP.Url {
+    var output = HTTP.Url(scheme:"http", host:"localhost", port:80, target:"/")
+    match result {
+        success(value) => { output = value }
+        failure(error) => { panic(error.detail) }
+    }
+    return output
+}
+
+func require_parameters(result:Result<HTTP.QueryParameter[], HTTP.Error>) HTTP.QueryParameter[] {
+    var output:HTTP.QueryParameter[] = []
+    match result {
+        success(value) => { output = value }
+        failure(error) => { panic(error.detail) }
+    }
+    return output
+}
+
+func require_response(result:Result<HTTP.Response, HTTP.Error>) HTTP.Response {
+    var output = HTTP.Response(500)
+    match result {
+        success(value) => { output = value }
+        failure(error) => { panic(error.detail) }
+    }
+    return output
+}
+
+func require_text(result:Result<str, HTTP.Error>) str {
+    var output = ""
+    match result {
+        success(value) => { output = value }
+        failure(error) => { panic(error.detail) }
+    }
+    return output
 }
 
 test "parse URL authority target and fragment" {
@@ -124,4 +161,151 @@ test "reject conflicting response framing" {
         success(response) => { panic("conflicting framing should fail") }
         failure(error) => { assert(error.kind == HTTP.ErrorKind.malformed_message) }
     }
+}
+
+test "parse and encode query parameters" {
+    var url = HTTP.Url(scheme:"https", host:"example.com", port:443, target:"/")
+    match HTTP.Url.parse("https://example.com/search?q=Silex+HTTP&tag=a%2Fb&tag=second") {
+        failure(error) => { panic(error.detail) }
+        success(value) => { url = value }
+    }
+    assert(url.path() == "/search")
+    if let query = url.query() { assert(query == "q=Silex+HTTP&tag=a%2Fb&tag=second") }
+    else { panic("query should be present") }
+    match url.query_parameter("q") {
+        failure(error) => { panic(error.detail) }
+        success(value) => {
+            if let text = value { assert(text == "Silex HTTP") }
+            else { panic("q should be present") }
+        }
+    }
+    let parameters = require_parameters(url.query_parameters())
+    assert(parameters.count() == 3)
+    assert(parameters[1].name == "tag" && parameters[1].value == "a/b")
+    assert(HTTP.encode_query_component("Silex & HTTP") == "Silex%20%26%20HTTP")
+    assert(HTTP.encode_query([
+        HTTP.QueryParameter(name:"page", value:"1"),
+        HTTP.QueryParameter(name:"filter", value:"a/b")
+    ]) == "page=1&filter=a%2Fb")
+}
+
+test "resolve relative redirect locations" {
+    let base = require_url(HTTP.Url.parse("https://example.com/docs/guide/index.html?old=1"))
+    let sibling = require_url(base.resolve("../api?q=1"))
+    assert(sibling.scheme == "https")
+    assert(sibling.authority() == "example.com")
+    assert(sibling.target == "/docs/api?q=1")
+    let absolute = require_url(base.resolve("/health"))
+    assert(absolute.target == "/health")
+}
+
+test "require exactly one Host header in HTTP 1.1 requests" {
+    var missing = MemoryStream("GET / HTTP/1.1\r\n\r\n")
+    match Codec.read_request(missing, HTTP.default_limits()) {
+        success(request) => { panic("missing Host should fail") }
+        failure(error) => { assert(error.kind == HTTP.ErrorKind.malformed_message) }
+    }
+    var repeated = MemoryStream("GET / HTTP/1.1\r\nHost: one\r\nHost: two\r\n\r\n")
+    match Codec.read_request(repeated, HTTP.default_limits()) {
+        success(request) => { panic("repeated Host should fail") }
+        failure(error) => { assert(error.kind == HTTP.ErrorKind.malformed_message) }
+    }
+}
+
+test "skip bounded informational responses" {
+    var stream = MemoryStream(
+        "HTTP/1.1 100 Continue\r\nX-Interim: yes\r\n\r\n" +
+        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"
+    )
+    var response = require_response(Codec.read_response(stream, HTTP.default_limits(), true))
+    assert(response.status() == 200)
+    assert(require_text(response.text()) == "hello")
+}
+
+test "reject malformed status separators and framing trailers" {
+    var status = MemoryStream("HTTP/1.1 200Xbad\r\nContent-Length: 0\r\n\r\n")
+    match Codec.read_response(status, HTTP.default_limits(), true) {
+        success(response) => { panic("invalid status separator should fail") }
+        failure(error) => { assert(error.kind == HTTP.ErrorKind.malformed_message) }
+    }
+    var missing_space = MemoryStream("HTTP/1.1 200\r\nContent-Length: 0\r\n\r\n")
+    match Codec.read_response(missing_space, HTTP.default_limits(), true) {
+        success(response) => { panic("status line without trailing space should fail") }
+        failure(error) => { assert(error.kind == HTTP.ErrorKind.malformed_message) }
+    }
+    var trailer = MemoryStream(
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" +
+        "1\r\na\r\n0\r\nContent-Length: 1\r\n\r\n"
+    )
+    match Codec.read_response(trailer, HTTP.default_limits(), true) {
+        success(response) => { panic("framing trailer should fail") }
+        failure(error) => { assert(error.kind == HTTP.ErrorKind.malformed_message) }
+    }
+}
+
+test "stream decoded response bodies to a writer" {
+    var input = MemoryStream(
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" +
+        "5\r\nHello\r\n6\r\n Silex\r\n0\r\n\r\n"
+    )
+    var output = MemoryStream("")
+    var response = require_response(Codec.read_response_to(input, output, HTTP.default_limits(), true))
+    assert(response.status() == 200)
+    let buffered = response.body()
+    assert(buffered.count() == 0)
+    assert(output.written_text() == "Hello Silex")
+}
+
+test "stream encoded request bodies from a reader" {
+    var input = MemoryStream("streamed")
+    var output = MemoryStream("")
+    var request = HTTP.Request.post("/upload")
+    request.headers().set("Host", "example.com")
+    request.headers().set("Content-Type", "application/octet-stream")
+    match Codec.write_request_from(output, request, input, 8, HTTP.default_limits().maximum_body_bytes) {
+        failure(error) => { panic(error.detail) }
+        success => {}
+    }
+    assert(
+        output.written_text() ==
+            "POST /upload HTTP/1.1\r\n" +
+            "Host: example.com\r\n" +
+            "Content-Type: application/octet-stream\r\n" +
+            "Content-Length: 8\r\n" +
+            "Connection: close\r\n\r\nstreamed"
+    )
+}
+
+test "make unsuccessful status handling explicit" {
+    var response = HTTP.Response.text(404, "missing")
+    assert(!response.is_success())
+    match response.require_success() {
+        success => { panic("404 should not be successful") }
+        failure(error) => {
+            assert(error.kind == HTTP.ErrorKind.http_status)
+            if let status = error.subject { assert(status == "404") }
+            else { panic("status subject should be present") }
+        }
+    }
+}
+
+test "rewrite and sanitize redirected requests" {
+    var request = HTTP.Request.post("/login")
+    request.set_text("credentials")
+    request.headers().set("Authorization", "Bearer secret")
+    request.headers().set("Cookie", "session=secret")
+    let destination = require_url(HTTP.Url.parse("https://other.example/welcome"))
+    var redirected = Client.redirect_request(request, 302, destination, false)
+    assert(redirected.method() == HTTP.Method.get)
+    assert(redirected.target() == "/welcome")
+    assert(!redirected.headers().contains("Authorization"))
+    assert(!redirected.headers().contains("Cookie"))
+    assert(!redirected.headers().contains("Content-Type"))
+    let body = redirected.body()
+    assert(body.count() == 0)
+
+    var preserved = Client.redirect_request(request, 307, destination, true)
+    assert(preserved.method() == HTTP.Method.post)
+    assert(preserved.headers().contains("Authorization"))
+    assert(require_text(preserved.text()) == "credentials")
 }

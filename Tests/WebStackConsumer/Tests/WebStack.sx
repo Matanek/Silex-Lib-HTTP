@@ -1,5 +1,6 @@
 use HTML
 use HTTP
+use HTTP.Client
 use JSON
 use STD.Network.TLS
 use XML
@@ -15,7 +16,11 @@ test "compose public web package APIs" {
     assert(payload.require_string("status") == "ok")
 
     var page = HTML.parse("<!doctype html><h1>Silex</h1>")
-    assert(page.elements("h1")[0].text_content() == "Silex")
+    var headings = page.select("h1")
+    assert(headings.count() == 1)
+    if let heading = headings.first() {
+        assert(heading.text_content() == "Silex")
+    } else { panic("HTML selection should expose its first node") }
 
     var feed = XML.parse("<feed><entry>Silex</entry></feed>")
     assert(feed.elements("entry")[0].text_content() == "Silex")
@@ -27,5 +32,10 @@ test "compose public web package APIs" {
         }
         failure(error) => { panic(error.detail) }
     }
+    assert(HTTP.encode_query([
+        HTTP.QueryParameter(name:"format", value:"html"),
+        HTTP.QueryParameter(name:"language", value:"fr")
+    ]) == "format=html&language=fr")
+    assert(Client.default_options().maximum_redirects == 10)
     assert(TLS.available())
 }

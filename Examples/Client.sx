@@ -14,8 +14,9 @@ func run() Result<void, HTTP.Error> {
     var page_response = try Client.get("http://127.0.0.1:18080/")
     let page_text = try page_response.text()
     var page = HTML.parse(page_text)
-    assert(page.elements("h1")[0].text_content() == "Served by Silex")
-    print("HTML: $(page.elements("h1")[0].text_content())")
+    var headings = page.select("h1")
+    assert(headings.text_content() == "Served by Silex")
+    print("HTML: $(headings.text_content())")
     return Result<void, HTTP.Error>.success()
 }
 

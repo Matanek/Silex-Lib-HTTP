@@ -9,6 +9,26 @@ public struct Options {
     let accept_timeout_milliseconds:int?
     let read_timeout_milliseconds:int?
     let write_timeout_milliseconds:int?
+
+    func with_limits(value:HTTP.Limits) Options {
+        return Options(
+            backlog:self.backlog,
+            limits:value,
+            accept_timeout_milliseconds:self.accept_timeout_milliseconds,
+            read_timeout_milliseconds:self.read_timeout_milliseconds,
+            write_timeout_milliseconds:self.write_timeout_milliseconds
+        )
+    }
+
+    func with_accept_timeout(milliseconds:int?) Options {
+        return Options(
+            backlog:self.backlog,
+            limits:self.limits,
+            accept_timeout_milliseconds:milliseconds,
+            read_timeout_milliseconds:self.read_timeout_milliseconds,
+            write_timeout_milliseconds:self.write_timeout_milliseconds
+        )
+    }
 }
 
 public func default_options() Options {
@@ -19,6 +39,192 @@ public func default_options() Options {
         read_timeout_milliseconds:30_000,
         write_timeout_milliseconds:30_000
     )
+}
+
+public class IncomingBody {
+    private var connection:TCP.Stream?
+    private let limits:HTTP.Limits
+    private let framing_kind:int
+    private var remaining:int
+    private var chunk_remaining:int
+    private var total:int
+    private var metadata_budget:int
+    private var complete:bool
+
+    package init(stream:TCP.Stream, limits:HTTP.Limits, framing:Codec.BodyFraming) {
+        self.connection = stream
+        self.limits = limits
+        self.framing_kind = framing.kind
+        self.remaining = framing.length
+        self.chunk_remaining = 0
+        self.total = 0
+        self.metadata_budget = limits.maximum_header_bytes
+        self.complete = framing.kind == 0 || (framing.kind == 1 && framing.length == 0)
+    }
+
+    package static func open(
+        stream:TCP.Stream,
+        headers:HTTP.Headers,
+        limits:HTTP.Limits
+    ) Result<IncomingBody, HTTP.Error> {
+        if limits.maximum_body_bytes < 0 {
+            return Result<IncomingBody, HTTP.Error>.failure(HTTP.failure(
+                HTTP.ErrorKind.body_limit, null, "maximum_body_bytes must be non-negative"
+            ))
+        }
+        var framing = Codec.BodyFraming(kind:0, length:0)
+        match Codec.body_framing(headers) {
+            success(value) => { framing = value }
+            failure(error) => { return Result<IncomingBody, HTTP.Error>.failure(error) }
+        }
+        if framing.kind == 1 && framing.length > limits.maximum_body_bytes {
+            return Result<IncomingBody, HTTP.Error>.failure(HTTP.failure(
+                HTTP.ErrorKind.body_limit, null, "HTTP body exceeds maximum_body_bytes"
+            ))
+        }
+        return Result<IncomingBody, HTTP.Error>.success(IncomingBody(stream, limits, framing))
+    }
+
+    func finished() bool { return self.complete }
+
+    func read(maximum_bytes:int = 8_192) Result<uint8[], HTTP.Error> {
+        if maximum_bytes <= 0 {
+            return Result<uint8[], HTTP.Error>.failure(HTTP.failure(
+                HTTP.ErrorKind.body_stream, null, "incoming body read size must be positive"
+            ))
+        }
+        if self.complete { return Result<uint8[], HTTP.Error>.success([]) }
+        if var stream = self.connection {
+            if self.framing_kind == 1 {
+                var count = self.remaining
+                if count > maximum_bytes { count = maximum_bytes }
+                var bytes:uint8[] = []
+                match Codec.read_count<TCP.Stream>(stream, count) {
+                    success(value) => { bytes = value }
+                    failure(error) => { return Result<uint8[], HTTP.Error>.failure(error) }
+                }
+                self.remaining -= bytes.count()
+                self.total += bytes.count()
+                if self.remaining == 0 { self.complete = true }
+                return Result<uint8[], HTTP.Error>.success(bytes)
+            }
+            if self.framing_kind == 2 { return self.read_chunk(stream, maximum_bytes) }
+            self.complete = true
+            return Result<uint8[], HTTP.Error>.success([])
+        }
+        return Result<uint8[], HTTP.Error>.failure(HTTP.failure(
+            HTTP.ErrorKind.closed, null, "incoming HTTP body is no longer connected"
+        ))
+    }
+
+    func read_all() Result<uint8[], HTTP.Error> {
+        var result:uint8[] = []
+        while !self.complete {
+            var bytes:uint8[] = []
+            match self.read() {
+                success(value) => { bytes = value }
+                failure(error) => { return Result<uint8[], HTTP.Error>.failure(error) }
+            }
+            for byte in bytes { result.append(byte) }
+        }
+        return Result<uint8[], HTTP.Error>.success(result)
+    }
+
+    func discard() Result<void, HTTP.Error> {
+        while !self.complete {
+            match self.read() {
+                success(bytes) => {}
+                failure(error) => { return Result<void, HTTP.Error>.failure(error) }
+            }
+        }
+        return Result<void, HTTP.Error>.success()
+    }
+
+    private func read_chunk(stream:TCP.Stream, maximum_bytes:int) Result<uint8[], HTTP.Error> {
+        var connection = stream
+        while self.chunk_remaining == 0 {
+            var line = ""
+            var budget = self.metadata_budget
+            match Codec.read_line<TCP.Stream>(connection, budget, "HTTP chunk size") {
+                success(value) => { line = value; self.metadata_budget = budget }
+                failure(error) => { return Result<uint8[], HTTP.Error>.failure(error) }
+            }
+            let size = Codec.parse_chunk_size(line)
+            if size < 0 {
+                return Result<uint8[], HTTP.Error>.failure(HTTP.failure(
+                    HTTP.ErrorKind.malformed_message, null, "HTTP chunk size is not hexadecimal"
+                ))
+            }
+            if size == 0 {
+                match self.read_trailers(connection) {
+                    success => {}
+                    failure(error) => { return Result<uint8[], HTTP.Error>.failure(error) }
+                }
+                self.complete = true
+                return Result<uint8[], HTTP.Error>.success([])
+            }
+            if size > self.limits.maximum_body_bytes - self.total {
+                return Result<uint8[], HTTP.Error>.failure(HTTP.failure(
+                    HTTP.ErrorKind.body_limit, null, "HTTP chunked body exceeds maximum_body_bytes"
+                ))
+            }
+            self.chunk_remaining = size
+        }
+        var count = self.chunk_remaining
+        if count > maximum_bytes { count = maximum_bytes }
+        var bytes:uint8[] = []
+        match Codec.read_count<TCP.Stream>(connection, count) {
+            success(value) => { bytes = value }
+            failure(error) => { return Result<uint8[], HTTP.Error>.failure(error) }
+        }
+        self.chunk_remaining -= bytes.count()
+        self.total += bytes.count()
+        if self.chunk_remaining == 0 {
+            var ending:uint8[] = []
+            match Codec.read_count<TCP.Stream>(connection, 2) {
+                success(value) => { ending = value }
+                failure(error) => { return Result<uint8[], HTTP.Error>.failure(error) }
+            }
+            if ending[0] != 13 || ending[1] != 10 {
+                return Result<uint8[], HTTP.Error>.failure(HTTP.failure(
+                    HTTP.ErrorKind.malformed_message, null, "HTTP chunk is not followed by CRLF"
+                ))
+            }
+        }
+        return Result<uint8[], HTTP.Error>.success(bytes)
+    }
+
+    private func read_trailers(stream:TCP.Stream) Result<void, HTTP.Error> {
+        var connection = stream
+        var count = 0
+        while true {
+            var line = ""
+            var budget = self.metadata_budget
+            match Codec.read_line<TCP.Stream>(connection, budget, "HTTP trailer") {
+                success(value) => { line = value; self.metadata_budget = budget }
+                failure(error) => { return Result<void, HTTP.Error>.failure(error) }
+            }
+            if line == "" { return Result<void, HTTP.Error>.success() }
+            count++
+            if count > self.limits.maximum_headers {
+                return Result<void, HTTP.Error>.failure(HTTP.failure(
+                    HTTP.ErrorKind.header_limit, null, "HTTP trailers exceed maximum_headers"
+                ))
+            }
+            var header = HTTP.Header(name:"", value:"")
+            match Codec.parse_header_line(line) {
+                success(value) => { header = value }
+                failure(error) => { return Result<void, HTTP.Error>.failure(error) }
+            }
+            let name = HTTP.ascii_lower(header.name)
+            if name == "content-length" || name == "transfer-encoding" || name == "host" {
+                return Result<void, HTTP.Error>.failure(HTTP.failure(
+                    HTTP.ErrorKind.malformed_message, null, "HTTP trailer contains a forbidden framing field"
+                ))
+            }
+        }
+        panic("HTTP trailer reader terminated unexpectedly")
+    }
 }
 
 public class Listener {
@@ -53,7 +259,7 @@ public class Listener {
     func serve_once(handler:func(@HTTP.Request) HTTP.Response) Result<void, HTTP.Error> {
         if var socket = self.socket {
             var accepted = try accept(socket, self.options)
-            var result = serve_connection(accepted.stream, self.options.limits, handler)
+            var result = serve_connection(accepted.stream, accepted.peer, self.options.limits, handler)
             close_stream(accepted.stream)
             return result
         }
@@ -65,8 +271,75 @@ public class Listener {
     }
 
     func serve(handler:func(@HTTP.Request) HTTP.Response) Result<void, HTTP.Error> {
-        while true { try self.serve_once(handler) }
-        panic("HTTP server loop terminated unexpectedly")
+        return self.serve_while(handler, func() bool { return true })
+    }
+
+    func serve_while(
+        handler:func(@HTTP.Request) HTTP.Response,
+        continue_serving:func() bool
+    ) Result<void, HTTP.Error> {
+        while continue_serving() {
+            if var socket = self.socket {
+                var accepted = try accept(socket, self.options)
+                var result = serve_connection(accepted.stream, accepted.peer, self.options.limits, handler)
+                close_stream(accepted.stream)
+                match result {
+                    success => {}
+                    failure(error) => {
+                        if !connection_error(error) { return Result<void, HTTP.Error>.failure(error) }
+                    }
+                }
+            } else {
+                return Result<void, HTTP.Error>.failure(HTTP.failure(
+                    HTTP.ErrorKind.closed, null, "HTTP listener is closed"
+                ))
+            }
+        }
+        return Result<void, HTTP.Error>.success()
+    }
+
+    func serve_stream_once(
+        handler:func(@HTTP.Request, IncomingBody) HTTP.Response
+    ) Result<void, HTTP.Error> {
+        if var socket = self.socket {
+            var accepted = try accept(socket, self.options)
+            var result = serve_stream_connection(accepted.stream, accepted.peer, self.options.limits, handler)
+            close_stream(accepted.stream)
+            return result
+        }
+        return Result<void, HTTP.Error>.failure(HTTP.failure(
+            HTTP.ErrorKind.closed, null, "HTTP listener is closed"
+        ))
+    }
+
+    func serve_stream(
+        handler:func(@HTTP.Request, IncomingBody) HTTP.Response
+    ) Result<void, HTTP.Error> {
+        return self.serve_stream_while(handler, func() bool { return true })
+    }
+
+    func serve_stream_while(
+        handler:func(@HTTP.Request, IncomingBody) HTTP.Response,
+        continue_serving:func() bool
+    ) Result<void, HTTP.Error> {
+        while continue_serving() {
+            if var socket = self.socket {
+                var accepted = try accept(socket, self.options)
+                var result = serve_stream_connection(accepted.stream, accepted.peer, self.options.limits, handler)
+                close_stream(accepted.stream)
+                match result {
+                    success => {}
+                    failure(error) => {
+                        if !connection_error(error) { return Result<void, HTTP.Error>.failure(error) }
+                    }
+                }
+            } else {
+                return Result<void, HTTP.Error>.failure(HTTP.failure(
+                    HTTP.ErrorKind.closed, null, "HTTP listener is closed"
+                ))
+            }
+        }
+        return Result<void, HTTP.Error>.success()
     }
 
     func close() Result<void, HTTP.Error> {
@@ -129,13 +402,85 @@ public func listen(host:str, port:uint16, options:Options) Result<Listener, HTTP
 
 func serve_connection(
     stream:TCP.Stream,
+    peer:Network.Endpoint,
     limits:HTTP.Limits,
     handler:func(@HTTP.Request) HTTP.Response
 ) Result<void, HTTP.Error> {
     var connection = stream
-    var request = try Codec.read_request<TCP.Stream>(connection, limits)
+    var request = HTTP.Request.get("/")
+    match Codec.read_request_head<TCP.Stream>(connection, limits) {
+        success(value) => { request = value }
+        failure(error) => { return fail_connection(connection, error) }
+    }
+    request.set_peer(peer)
+    var incoming = IncomingBody.open(connection, request.headers(), limits)
+    var body:IncomingBody? = null
+    match incoming {
+        success(value) => { body = value }
+        failure(error) => { return fail_connection(connection, error) }
+    }
+    if var source = body {
+        match source.read_all() {
+            success(bytes) => { request.set_body(bytes) }
+            failure(error) => { return fail_connection(connection, error) }
+        }
+    }
     var response = handler(request)
     return Codec.write_response<TCP.Stream>(connection, response, request.method() != HTTP.Method.head)
+}
+
+func serve_stream_connection(
+    stream:TCP.Stream,
+    peer:Network.Endpoint,
+    limits:HTTP.Limits,
+    handler:func(@HTTP.Request, IncomingBody) HTTP.Response
+) Result<void, HTTP.Error> {
+    var connection = stream
+    var request = HTTP.Request.get("/")
+    match Codec.read_request_head<TCP.Stream>(connection, limits) {
+        success(value) => { request = value }
+        failure(error) => { return fail_connection(connection, error) }
+    }
+    request.set_peer(peer)
+    match IncomingBody.open(connection, request.headers(), limits) {
+        failure(error) => { return fail_connection(connection, error) }
+        success(body) => {
+            var response = handler(request, body)
+            return Codec.write_response<TCP.Stream>(connection, response, request.method() != HTTP.Method.head)
+        }
+    }
+}
+
+func fail_connection(
+    stream:TCP.Stream,
+    error:HTTP.Error
+) Result<void, HTTP.Error> {
+    var connection = stream
+    let status = protocol_status(error.kind)
+    if status > 0 {
+        var response = HTTP.Response.text(status, error.detail)
+        match Codec.write_response<TCP.Stream>(connection, response, true) {
+            success => {}
+            failure(write_error) => { return Result<void, HTTP.Error>.failure(write_error) }
+        }
+    }
+    return Result<void, HTTP.Error>.failure(error)
+}
+
+func protocol_status(kind:HTTP.ErrorKind) int {
+    if kind == HTTP.ErrorKind.malformed_message || kind == HTTP.ErrorKind.invalid_text { return 400 }
+    if kind == HTTP.ErrorKind.header_limit { return 431 }
+    if kind == HTTP.ErrorKind.body_limit { return 413 }
+    if kind == HTTP.ErrorKind.unsupported_transfer || kind == HTTP.ErrorKind.unsupported_upgrade { return 501 }
+    return 0
+}
+
+func connection_error(error:HTTP.Error) bool {
+    return error.kind == HTTP.ErrorKind.malformed_message || error.kind == HTTP.ErrorKind.header_limit ||
+        error.kind == HTTP.ErrorKind.body_limit || error.kind == HTTP.ErrorKind.unsupported_transfer ||
+        error.kind == HTTP.ErrorKind.unsupported_upgrade || error.kind == HTTP.ErrorKind.invalid_text ||
+        error.kind == HTTP.ErrorKind.closed || error.kind == HTTP.ErrorKind.network ||
+        error.kind == HTTP.ErrorKind.body_stream
 }
 
 func accept(socket:&TCP.Listener, options:Options) Result<TCP.Accepted, HTTP.Error> {
