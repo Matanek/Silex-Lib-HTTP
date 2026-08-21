@@ -1,0 +1,14 @@
+{
+  "name": "HTTP",
+  "version": "0.1.0",
+  "requires": {
+    "silex": ">=0.38.37 <0.39.0"
+  },
+  "dependencies": {
+    "STD": "^0.16.8"
+  },
+  "devDependencies": {
+    "HTML": "^0.2.0",
+    "JSON": "^0.1.1"
+  }
+}

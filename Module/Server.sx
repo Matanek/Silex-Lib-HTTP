@@ -1,0 +1,163 @@
+use HTTP
+use HTTP.Codec
+use STD.Network
+use STD.Network.TCP
+
+public struct Options {
+    let backlog:int
+    let limits:HTTP.Limits
+    let accept_timeout_milliseconds:int?
+    let read_timeout_milliseconds:int?
+    let write_timeout_milliseconds:int?
+}
+
+public func default_options() Options {
+    return Options(
+        backlog:128,
+        limits:HTTP.default_limits(),
+        accept_timeout_milliseconds:null,
+        read_timeout_milliseconds:30_000,
+        write_timeout_milliseconds:30_000
+    )
+}
+
+public class Listener {
+    private var socket:TCP.Listener?
+    private let options:Options
+
+    package init(socket:TCP.Listener, options:Options) {
+        self.socket = socket
+        self.options = options
+    }
+
+    func local_endpoint() Result<Network.Endpoint, HTTP.Error> {
+        if var socket = self.socket {
+            match TCP.local_endpoint(socket) {
+                success(endpoint) => { return Result<Network.Endpoint, HTTP.Error>.success(endpoint) }
+                failure(error) => {
+                    return Result<Network.Endpoint, HTTP.Error>.failure(HTTP.failure(
+                        HTTP.ErrorKind.network,
+                        error.subject,
+                        error.detail
+                    ))
+                }
+            }
+        }
+        return Result<Network.Endpoint, HTTP.Error>.failure(HTTP.failure(
+            HTTP.ErrorKind.closed,
+            null,
+            "HTTP listener is closed"
+        ))
+    }
+
+    func serve_once(handler:func(@HTTP.Request) HTTP.Response) Result<void, HTTP.Error> {
+        if var socket = self.socket {
+            var accepted = try accept(socket, self.options)
+            var result = serve_connection(accepted.stream, self.options.limits, handler)
+            close_stream(accepted.stream)
+            return result
+        }
+        return Result<void, HTTP.Error>.failure(HTTP.failure(
+            HTTP.ErrorKind.closed,
+            null,
+            "HTTP listener is closed"
+        ))
+    }
+
+    func serve(handler:func(@HTTP.Request) HTTP.Response) Result<void, HTTP.Error> {
+        while true { try self.serve_once(handler) }
+        panic("HTTP server loop terminated unexpectedly")
+    }
+
+    func close() Result<void, HTTP.Error> {
+        if var socket = self.socket {
+            self.socket = null
+            match TCP.close(move socket) {
+                success => { return Result<void, HTTP.Error>.success() }
+                failure(error) => {
+                    return Result<void, HTTP.Error>.failure(HTTP.failure(
+                        HTTP.ErrorKind.network,
+                        error.subject,
+                        error.detail
+                    ))
+                }
+            }
+        }
+        return Result<void, HTTP.Error>.failure(HTTP.failure(
+            HTTP.ErrorKind.closed,
+            null,
+            "HTTP listener is already closed"
+        ))
+    }
+
+    drop {
+        if var socket = self.socket {
+            self.socket = null
+            match TCP.close(move socket) { success => {}; failure(error) => {} }
+        }
+    }
+}
+
+public func listen(host:str, port:uint16) Result<Listener, HTTP.Error> {
+    return listen(host, port, default_options())
+}
+
+public func listen(host:str, port:uint16, options:Options) Result<Listener, HTTP.Error> {
+    var address = Network.IpAddress.ipv4([0, 0, 0, 0])
+    match Network.parse_ip(host) {
+        success(value) => { address = value }
+        failure(error) => {
+            return Result<Listener, HTTP.Error>.failure(HTTP.failure(
+                HTTP.ErrorKind.network,
+                host,
+                "HTTP server bind host must be a numeric IP address: " + error.detail
+            ))
+        }
+    }
+    let endpoint = Network.Endpoint(address:address, port:port, scope_id:0)
+    match TCP.listen(endpoint, options.backlog) {
+        success(socket) => { return Result<Listener, HTTP.Error>.success(Listener(socket, options)) }
+        failure(error) => {
+            return Result<Listener, HTTP.Error>.failure(HTTP.failure(
+                HTTP.ErrorKind.network,
+                error.subject,
+                error.detail
+            ))
+        }
+    }
+}
+
+func serve_connection(
+    stream:TCP.Stream,
+    limits:HTTP.Limits,
+    handler:func(@HTTP.Request) HTTP.Response
+) Result<void, HTTP.Error> {
+    var connection = stream
+    var request = try Codec.read_request<TCP.Stream>(connection, limits)
+    var response = handler(request)
+    return Codec.write_response<TCP.Stream>(connection, response, request.method() != HTTP.Method.head)
+}
+
+func accept(socket:&TCP.Listener, options:Options) Result<TCP.Accepted, HTTP.Error> {
+    match TCP.accept(
+        socket,
+        options.accept_timeout_milliseconds,
+        TCP.StreamOptions(
+            read_timeout_milliseconds:options.read_timeout_milliseconds,
+            write_timeout_milliseconds:options.write_timeout_milliseconds
+        )
+    ) {
+        success(value) => { return Result<TCP.Accepted, HTTP.Error>.success(value) }
+        failure(error) => {
+            return Result<TCP.Accepted, HTTP.Error>.failure(HTTP.failure(
+                HTTP.ErrorKind.network,
+                error.subject,
+                error.detail
+            ))
+        }
+    }
+}
+
+func close_stream(stream:TCP.Stream) {
+    match TCP.close(move stream) { success => {}; failure(error) => {} }
+}

@@ -1,0 +1,135 @@
+use HTTP
+use HTTP.Codec
+use STD.Network.TCP
+use STD.Network.TLS
+
+public struct Options {
+    let limits:HTTP.Limits
+    let read_timeout_milliseconds:int?
+    let write_timeout_milliseconds:int?
+}
+
+public func default_options() Options {
+    return Options(
+        limits:HTTP.default_limits(),
+        read_timeout_milliseconds:30_000,
+        write_timeout_milliseconds:30_000
+    )
+}
+
+public func get(url:str) Result<HTTP.Response, HTTP.Error> {
+    return get(url, default_options())
+}
+
+public func get(url:str, options:Options) Result<HTTP.Response, HTTP.Error> {
+    let parsed = try HTTP.Url.parse(url)
+    var request = HTTP.Request.get(parsed.target)
+    return send_parsed(parsed, request, options)
+}
+
+public func send(url:str, request:HTTP.Request) Result<HTTP.Response, HTTP.Error> {
+    return send(url, request, default_options())
+}
+
+public func send(
+    url:str,
+    request:HTTP.Request,
+    options:Options
+) Result<HTTP.Response, HTTP.Error> {
+    let parsed = try HTTP.Url.parse(url)
+    return send_parsed(parsed, request, options)
+}
+
+func send_parsed(
+    url:HTTP.Url,
+    request:HTTP.Request,
+    options:Options
+) Result<HTTP.Response, HTTP.Error> {
+    var headers = request.headers()
+    if !headers.contains("Host") { headers.set("Host", url.authority()) }
+    if !headers.contains("User-Agent") { headers.set("User-Agent", "Silex-HTTP/0.1") }
+    if url.scheme == "http" { return send_tcp(url, request, options) }
+    if url.scheme == "https" { return send_tls(url, request, options) }
+    return Result<HTTP.Response, HTTP.Error>.failure(HTTP.failure(
+        HTTP.ErrorKind.unsupported_scheme,
+        url.scheme,
+        "HTTP supports only http and https URLs"
+    ))
+}
+
+func send_tcp(url:HTTP.Url, request:HTTP.Request, options:Options) Result<HTTP.Response, HTTP.Error> {
+    var stream = try connect(url, options)
+    match Codec.write_request<TCP.Stream>(stream, request) {
+        failure(error) => {
+            close_stream(stream)
+            return Result<HTTP.Response, HTTP.Error>.failure(error)
+        }
+        success => {}
+    }
+    var result = Codec.read_response<TCP.Stream>(stream, options.limits, request.method() != HTTP.Method.head)
+    close_stream(stream)
+    return result
+}
+
+func send_tls(url:HTTP.Url, request:HTTP.Request, options:Options) Result<HTTP.Response, HTTP.Error> {
+    match TLS.connect(url.host, url.port, TLS.ConnectOptions(
+        read_timeout_milliseconds:options.read_timeout_milliseconds,
+        write_timeout_milliseconds:options.write_timeout_milliseconds
+    )) {
+        success(stream) => {
+            return send_tls_connected(stream, request, options)
+        }
+        failure(error) => {
+            return Result<HTTP.Response, HTTP.Error>.failure(HTTP.failure(
+                HTTP.ErrorKind.secure_transport,
+                error.host,
+                error.detail
+            ))
+        }
+    }
+}
+
+func send_tls_connected(
+    stream:TLS.Stream,
+    request:HTTP.Request,
+    options:Options
+) Result<HTTP.Response, HTTP.Error> {
+    var connection = stream
+    match Codec.write_request<TLS.Stream>(connection, request) {
+        failure(error) => {
+            close_tls(connection)
+            return Result<HTTP.Response, HTTP.Error>.failure(error)
+        }
+        success => {}
+    }
+    var result = Codec.read_response<TLS.Stream>(connection, options.limits, request.method() != HTTP.Method.head)
+    close_tls(connection)
+    return result
+}
+
+func connect(url:HTTP.Url, options:Options) Result<TCP.Stream, HTTP.Error> {
+    match TCP.connect(url.host, url.port, TCP.ConnectOptions(
+        connect_timeout_milliseconds:null,
+        stream:TCP.StreamOptions(
+            read_timeout_milliseconds:options.read_timeout_milliseconds,
+            write_timeout_milliseconds:options.write_timeout_milliseconds
+        )
+    )) {
+        success(value) => { return Result<TCP.Stream, HTTP.Error>.success(value) }
+        failure(error) => {
+            return Result<TCP.Stream, HTTP.Error>.failure(HTTP.failure(
+                HTTP.ErrorKind.network,
+                error.subject,
+                error.detail
+            ))
+        }
+    }
+}
+
+func close_stream(stream:TCP.Stream) {
+    match TCP.close(move stream) { success => {}; failure(error) => {} }
+}
+
+func close_tls(stream:TLS.Stream) {
+    match TLS.close(stream) { success => {}; failure(error) => {} }
+}

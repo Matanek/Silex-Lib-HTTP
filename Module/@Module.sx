@@ -1,0 +1,439 @@
+use STD.Text.UTF8
+
+public enum Method {
+    get
+    head
+    post
+    put
+    patch
+    delete
+    options
+    trace
+    connect
+    custom(str)
+}
+
+public struct Header {
+    let name:str
+    let value:str
+}
+
+public enum ErrorKind {
+    invalid_url
+    unsupported_scheme
+    network
+    secure_transport
+    malformed_message
+    header_limit
+    body_limit
+    unsupported_transfer
+    invalid_text
+    closed
+}
+
+public struct Error {
+    let kind:ErrorKind
+    let subject:str?
+    let detail:str
+}
+
+public struct Limits {
+    let maximum_header_bytes:int
+    let maximum_headers:int
+    let maximum_body_bytes:int
+}
+
+public struct Url {
+    let scheme:str
+    let host:str
+    let port:uint16
+    let target:str
+
+    static func parse(value:str) Result<Url, Error> { return parse_url(value) }
+
+    func authority() str {
+        var name = self.host
+        if contains_byte(name, 58) { name = "[" + name + "]" }
+        if (self.scheme == "http" && self.port == 80) || (self.scheme == "https" && self.port == 443) {
+            return name
+        }
+        return name + ":" + decimal(self.port as int)
+    }
+}
+
+public class Headers {
+    private var entries:Header[]
+
+    init() { self.entries = [] }
+
+    func count() int { return self.entries.count() }
+    func values() Header[] { return self.entries }
+
+    func get(name:str) str? {
+        let expected = ascii_lower(name)
+        for entry in self.entries {
+            if ascii_lower(entry.name) == expected { return entry.value }
+        }
+        return null
+    }
+
+    func get_all(name:str) str[] {
+        let expected = ascii_lower(name)
+        var result:str[] = []
+        for entry in self.entries {
+            if ascii_lower(entry.name) == expected { result.append(entry.value) }
+        }
+        return result
+    }
+
+    func contains(name:str) bool { return self.get(name) != null }
+
+    func append(name:str, value:str) {
+        require_header(name, value)
+        self.entries.append(Header(name:name, value:value))
+    }
+
+    func set(name:str, value:str) {
+        require_header(name, value)
+        self.remove(name)
+        self.entries.append(Header(name:name, value:value))
+    }
+
+    func remove(name:str) int {
+        let expected = ascii_lower(name)
+        var removed = 0
+        var index = self.entries.count() - 1
+        while index >= 0 && self.entries.count() > 0 {
+            if ascii_lower(self.entries[index].name) == expected {
+                self.entries.take(index)
+                removed++
+            }
+            index--
+        }
+        return removed
+    }
+}
+
+public class Request {
+    private let request_method:Method
+    private let request_target:str
+    private var request_headers:Headers
+    private var request_body:uint8[]
+
+    init(method:Method, target:str) {
+        if target == "" { panic("HTTP request target cannot be empty") }
+        self.request_method = method
+        self.request_target = target
+        self.request_headers = Headers()
+        self.request_body = []
+    }
+
+    static func get(target:str) Request { return Request(Method.get, target) }
+    static func post(target:str) Request { return Request(Method.post, target) }
+
+    func method() Method { return self.request_method }
+    func target() str { return self.request_target }
+    func headers() Headers { return self.request_headers }
+    func body() uint8[] { return self.request_body }
+
+    func set_body(bytes:uint8[]) { self.request_body = bytes }
+
+    func set_text(text:str, content_type:str = "text/plain; charset=utf-8") {
+        self.request_body = UTF8.bytes(text)
+        self.request_headers.set("Content-Type", content_type)
+    }
+
+    func text() Result<str, Error> { return decode_text(self.request_body, "HTTP request body") }
+
+    package func replace_headers(headers:Headers) { self.request_headers = headers }
+}
+
+public class Response {
+    private let response_status:int
+    private let response_reason:str
+    private var response_headers:Headers
+    private var response_body:uint8[]
+
+    init(status:int, reason:str = "") {
+        if status < 100 || status > 999 { panic("HTTP response status must have three digits") }
+        self.response_status = status
+        self.response_reason = reason
+        self.response_headers = Headers()
+        self.response_body = []
+    }
+
+    static func text(
+        status:int,
+        text:str,
+        content_type:str = "text/plain; charset=utf-8"
+    ) Response {
+        var response = Response(status, reason_phrase(status))
+        response.response_body = UTF8.bytes(text)
+        response.response_headers.set("Content-Type", content_type)
+        return response
+    }
+
+    static func bytes(status:int, body:uint8[], content_type:str) Response {
+        var response = Response(status, reason_phrase(status))
+        response.response_body = body
+        response.response_headers.set("Content-Type", content_type)
+        return response
+    }
+
+    func status() int { return self.response_status }
+    func reason() str { return self.response_reason }
+    func headers() Headers { return self.response_headers }
+    func body() uint8[] { return self.response_body }
+    func is_success() bool { return self.response_status >= 200 && self.response_status < 300 }
+    func text() Result<str, Error> { return decode_text(self.response_body, "HTTP response body") }
+
+    package func replace_headers(headers:Headers) { self.response_headers = headers }
+    package func replace_body(body:uint8[]) { self.response_body = body }
+}
+
+public func default_limits() Limits {
+    return Limits(
+        maximum_header_bytes:64 * 1024,
+        maximum_headers:128,
+        maximum_body_bytes:16 * 1024 * 1024
+    )
+}
+
+public func method_text(method:Method) str {
+    return match method {
+        get => "GET"
+        head => "HEAD"
+        post => "POST"
+        put => "PUT"
+        patch => "PATCH"
+        delete => "DELETE"
+        options => "OPTIONS"
+        trace => "TRACE"
+        connect => "CONNECT"
+        custom(value) => value
+    }
+}
+
+package func parse_method(value:str) Method {
+    if value == "GET" { return Method.get }
+    if value == "HEAD" { return Method.head }
+    if value == "POST" { return Method.post }
+    if value == "PUT" { return Method.put }
+    if value == "PATCH" { return Method.patch }
+    if value == "DELETE" { return Method.delete }
+    if value == "OPTIONS" { return Method.options }
+    if value == "TRACE" { return Method.trace }
+    if value == "CONNECT" { return Method.connect }
+    return Method.custom(value)
+}
+
+package func failure(kind:ErrorKind, subject:str?, detail:str) Error {
+    return Error(kind:kind, subject:subject, detail:detail)
+}
+
+package func ascii_lower(value:str) str {
+    var bytes = UTF8.bytes(value)
+    var index = 0
+    while index < bytes.count() {
+        if bytes[index] >= 65 && bytes[index] <= 90 { bytes[index] += 32 }
+        index++
+    }
+    return text_from_bytes(bytes)
+}
+
+package func trim(value:str) str {
+    let bytes = UTF8.bytes(value)
+    var start = 0
+    var end = bytes.count()
+    while start < end && (bytes[start] == 32 || bytes[start] == 9) { start++ }
+    while end > start && (bytes[end - 1] == 32 || bytes[end - 1] == 9) { end-- }
+    if start == end { return "" }
+    var result:uint8[] = []
+    var index = start
+    while index < end { result.append(bytes[index]); index++ }
+    return text_from_bytes(result)
+}
+
+package func decimal(value:int) str {
+    if value == 0 { return "0" }
+    var bytes:uint8[] = []
+    var remaining = value
+    while remaining > 0 {
+        bytes.prepend((48 + remaining % 10) as uint8)
+        remaining /= 10
+    }
+    return text_from_bytes(bytes)
+}
+
+package func text_from_bytes(bytes:uint8[]) str {
+    if bytes.count() == 0 { return "" }
+    match UTF8.decode(@bytes[0:bytes.count()]) {
+        success(text) => { return text }
+        failure(error) => { panic("internal HTTP text is not UTF-8") }
+    }
+}
+
+func decode_text(bytes:uint8[], subject:str) Result<str, Error> {
+    if bytes.count() == 0 { return Result<str, Error>.success("") }
+    match UTF8.decode(@bytes[0:bytes.count()]) {
+        success(text) => { return Result<str, Error>.success(text) }
+        failure(error) => {
+            return Result<str, Error>.failure(failure(
+                ErrorKind.invalid_text,
+                subject,
+                "body is not valid UTF-8 at byte $(error.byte_offset)"
+            ))
+        }
+    }
+}
+
+func parse_url(value:str) Result<Url, Error> {
+    let bytes = UTF8.bytes(value)
+    var separator = -1
+    var index = 0
+    while index + 2 < bytes.count() {
+        if bytes[index] == 58 && bytes[index + 1] == 47 && bytes[index + 2] == 47 {
+            separator = index
+            break
+        }
+        index++
+    }
+    if separator <= 0 {
+        return Result<Url, Error>.failure(failure(ErrorKind.invalid_url, value, "URL requires an http:// or https:// scheme"))
+    }
+    let scheme = ascii_lower(byte_slice(bytes, 0, separator))
+    if scheme != "http" && scheme != "https" {
+        return Result<Url, Error>.failure(failure(ErrorKind.unsupported_scheme, value, "HTTP supports only http and https URLs"))
+    }
+    let authority_start = separator + 3
+    var authority_end = authority_start
+    while authority_end < bytes.count() && bytes[authority_end] != 47 && bytes[authority_end] != 63 && bytes[authority_end] != 35 { authority_end++ }
+    if authority_end == authority_start {
+        return Result<Url, Error>.failure(failure(ErrorKind.invalid_url, value, "URL host is empty"))
+    }
+    let authority = byte_slice(bytes, authority_start, authority_end)
+    if contains_byte(authority, 64) {
+        return Result<Url, Error>.failure(failure(ErrorKind.invalid_url, value, "userinfo is not supported in HTTP URLs"))
+    }
+    var host = authority
+    var port = 80 as uint16
+    if scheme == "https" { port = 443 as uint16 }
+    let authority_bytes = UTF8.bytes(authority)
+    if authority_bytes[0] == 91 {
+        var closing = 1
+        while closing < authority_bytes.count() && authority_bytes[closing] != 93 { closing++ }
+        if closing >= authority_bytes.count() {
+            return Result<Url, Error>.failure(failure(ErrorKind.invalid_url, value, "IPv6 host is missing a closing bracket"))
+        }
+        host = byte_slice(authority_bytes, 1, closing)
+        if closing + 1 < authority_bytes.count() {
+            if authority_bytes[closing + 1] != 58 {
+                return Result<Url, Error>.failure(failure(ErrorKind.invalid_url, value, "invalid text after IPv6 host"))
+            }
+            match parse_port(byte_slice(authority_bytes, closing + 2, authority_bytes.count()), value) {
+                success(parsed) => { port = parsed }
+                failure(error) => { return Result<Url, Error>.failure(error) }
+            }
+        }
+    } else {
+        var colon = -1
+        index = 0
+        while index < authority_bytes.count() {
+            if authority_bytes[index] == 58 { colon = index }
+            index++
+        }
+        if colon >= 0 {
+            host = byte_slice(authority_bytes, 0, colon)
+            match parse_port(byte_slice(authority_bytes, colon + 1, authority_bytes.count()), value) {
+                success(parsed) => { port = parsed }
+                failure(error) => { return Result<Url, Error>.failure(error) }
+            }
+        }
+    }
+    if host == "" {
+        return Result<Url, Error>.failure(failure(ErrorKind.invalid_url, value, "URL host is empty"))
+    }
+    var target = "/"
+    if authority_end < bytes.count() {
+        let tail = byte_slice(bytes, authority_end, bytes.count())
+        if bytes[authority_end] == 63 { target = "/" + tail }
+        elif bytes[authority_end] == 35 { target = "/" }
+        else { target = tail }
+        let target_bytes = UTF8.bytes(target)
+        var fragment = -1
+        index = 0
+        while index < target_bytes.count() {
+            if target_bytes[index] == 35 { fragment = index; break }
+            index++
+        }
+        if fragment >= 0 { target = byte_slice(target_bytes, 0, fragment) }
+    }
+    return Result<Url, Error>.success(Url(scheme:scheme, host:host, port:port, target:target))
+}
+
+func parse_port(value:str, subject:str) Result<uint16, Error> {
+    let bytes = UTF8.bytes(value)
+    if bytes.count() == 0 {
+        return Result<uint16, Error>.failure(failure(ErrorKind.invalid_url, subject, "URL port is empty"))
+    }
+    var number = 0
+    for byte in bytes {
+        if byte < 48 || byte > 57 {
+            return Result<uint16, Error>.failure(failure(ErrorKind.invalid_url, subject, "URL port is not numeric"))
+        }
+        number = number * 10 + (byte - 48) as int
+        if number > 65_535 {
+            return Result<uint16, Error>.failure(failure(ErrorKind.invalid_url, subject, "URL port is outside uint16"))
+        }
+    }
+    if number == 0 {
+        return Result<uint16, Error>.failure(failure(ErrorKind.invalid_url, subject, "URL port must be positive"))
+    }
+    return Result<uint16, Error>.success(number as uint16)
+}
+
+func require_header(name:str, value:str) {
+    let name_bytes = UTF8.bytes(name)
+    if name_bytes.count() == 0 { panic("HTTP header name cannot be empty") }
+    for byte in name_bytes {
+        if !header_name_byte(byte) { panic("invalid HTTP header name '$(name)'") }
+    }
+    for byte in UTF8.bytes(value) {
+        if byte == 0 || byte == 10 || byte == 13 { panic("HTTP header value contains a forbidden control character") }
+    }
+}
+
+package func header_name_byte(byte:uint8) bool {
+    if (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) { return true }
+    return byte == 33 || byte == 35 || byte == 36 || byte == 37 || byte == 38 || byte == 39 ||
+        byte == 42 || byte == 43 || byte == 45 || byte == 46 || byte == 94 || byte == 95 ||
+        byte == 96 || byte == 124 || byte == 126
+}
+
+func byte_slice(bytes:uint8[], start:int, end:int) str {
+    if start >= end { return "" }
+    var result:uint8[] = []
+    var index = start
+    while index < end { result.append(bytes[index]); index++ }
+    return text_from_bytes(result)
+}
+
+func contains_byte(value:str, expected:uint8) bool {
+    for byte in UTF8.bytes(value) { if byte == expected { return true } }
+    return false
+}
+
+func reason_phrase(status:int) str {
+    if status == 200 { return "OK" }
+    if status == 201 { return "Created" }
+    if status == 204 { return "No Content" }
+    if status == 301 { return "Moved Permanently" }
+    if status == 302 { return "Found" }
+    if status == 304 { return "Not Modified" }
+    if status == 400 { return "Bad Request" }
+    if status == 404 { return "Not Found" }
+    if status == 405 { return "Method Not Allowed" }
+    if status == 413 { return "Content Too Large" }
+    if status == 500 { return "Internal Server Error" }
+    return ""
+}

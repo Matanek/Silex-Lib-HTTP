@@ -1,0 +1,31 @@
+use HTML
+use HTTP
+use JSON
+use STD.Network.TLS
+use XML
+
+test "compose public web package APIs" {
+    var response = HTTP.Response.text(200, "{\"status\":\"ok\"}", "application/json")
+    var response_text = ""
+    match response.text() {
+        success(text) => { response_text = text }
+        failure(error) => { panic(error.detail) }
+    }
+    var payload = JSON.parse(response_text)
+    assert(payload.require_string("status") == "ok")
+
+    var page = HTML.parse("<!doctype html><h1>Silex</h1>")
+    assert(page.elements("h1")[0].text_content() == "Silex")
+
+    var feed = XML.parse("<feed><entry>Silex</entry></feed>")
+    assert(feed.elements("entry")[0].text_content() == "Silex")
+
+    match HTTP.Url.parse("https://example.com/docs?q=1") {
+        success(url) => {
+            assert(url.port == 443)
+            assert(url.target == "/docs?q=1")
+        }
+        failure(error) => { panic(error.detail) }
+    }
+    assert(TLS.available())
+}

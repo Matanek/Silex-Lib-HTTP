@@ -1,0 +1,32 @@
+use HTML
+use HTTP
+use HTTP.Server
+use STD.Network
+
+func handle(request:@HTTP.Request) HTTP.Response {
+    if request.target() == "/api/health" {
+        return HTTP.Response.text(200, "{\"status\":\"ok\"}", "application/json; charset=utf-8")
+    }
+    if request.target() == "/" {
+        var page = HTML.html_document("Silex HTTP")
+        var body = page.elements("body")[0]
+        body.append_element("h1").append_text("Served by Silex")
+        body.append_element("p").append_text("HTTP and HTML compose as independent packages.")
+        return HTTP.Response.text(200, HTML.serialize(page), "text/html; charset=utf-8")
+    }
+    return HTTP.Response.text(404, "Not found")
+}
+
+func run() Result<void, HTTP.Error> {
+    var server = try Server.listen("127.0.0.1", 18080)
+    let endpoint = try server.local_endpoint()
+    print("Listening on http://$(Network.format_endpoint(endpoint))")
+    return server.serve(handle)
+}
+
+func main() {
+    match run() {
+        failure(error) => { panic(error.detail) }
+        success => {}
+    }
+}

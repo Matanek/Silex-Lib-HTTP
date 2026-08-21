@@ -1,0 +1,460 @@
+use HTTP
+use STD.IO
+use STD.Text.UTF8
+
+struct BodyFraming {
+    let kind:int
+    let length:int
+}
+
+package func read_request<T:IO.Reader>(reader:&T, limits:HTTP.Limits) Result<HTTP.Request, HTTP.Error> {
+    var remaining_headers = limits.maximum_header_bytes
+    var start = try read_line<T>(reader, remaining_headers, "HTTP request line")
+    let parts = split_spaces(start)
+    if parts.count() != 3 || parts[0] == "" || parts[1] == "" || parts[2] != "HTTP/1.1" {
+        return fail_request(HTTP.ErrorKind.malformed_message, "request line must be METHOD target HTTP/1.1")
+    }
+    if !valid_method(parts[0]) {
+        return fail_request(HTTP.ErrorKind.malformed_message, "request method contains an invalid byte")
+    }
+    var headers = try read_headers<T>(reader, limits, remaining_headers)
+    var body = try read_body<T>(reader, headers, limits, false)
+    var request = HTTP.Request(HTTP.parse_method(parts[0]), parts[1])
+    request.replace_headers(headers)
+    request.set_body(body)
+    return Result<HTTP.Request, HTTP.Error>.success(request)
+}
+
+package func read_response<T:IO.Reader>(
+    reader:&T,
+    limits:HTTP.Limits,
+    expect_body:bool
+) Result<HTTP.Response, HTTP.Error> {
+    var remaining_headers = limits.maximum_header_bytes
+    var start = try read_line<T>(reader, remaining_headers, "HTTP status line")
+    if !starts_with(start, "HTTP/1.1 ") && !starts_with(start, "HTTP/1.0 ") {
+        return fail_response(HTTP.ErrorKind.malformed_message, "status line must begin with HTTP/1.1 or HTTP/1.0")
+    }
+    let bytes = UTF8.bytes(start)
+    if bytes.count() < 12 || bytes[9] < 48 || bytes[9] > 57 || bytes[10] < 48 || bytes[10] > 57 || bytes[11] < 48 || bytes[11] > 57 {
+        return fail_response(HTTP.ErrorKind.malformed_message, "response status must contain three digits")
+    }
+    let status = ((bytes[9] - 48) as int) * 100 + ((bytes[10] - 48) as int) * 10 + (bytes[11] - 48) as int
+    var reason = ""
+    if bytes.count() > 13 { reason = bytes_text(bytes, 13, bytes.count()) }
+    var headers = try read_headers<T>(reader, limits, remaining_headers)
+    var response = HTTP.Response(status, reason)
+    response.replace_headers(headers)
+    if expect_body && !body_forbidden(status) {
+        var body = try read_body<T>(reader, headers, limits, true)
+        response.replace_body(body)
+    }
+    return Result<HTTP.Response, HTTP.Error>.success(response)
+}
+
+package func write_request<T:IO.Writer>(writer:&T, request:@HTTP.Request) Result<void, HTTP.Error> {
+    var bytes:uint8[] = []
+    append_text(bytes, HTTP.method_text(request.method()) + " " + request.target() + " HTTP/1.1\r\n")
+    var headers = request.headers()
+    append_headers(bytes, headers)
+    let body = request.body()
+    append_text(bytes, "Content-Length: " + HTTP.decimal(body.count()) + "\r\n")
+    append_text(bytes, "Connection: close\r\n\r\n")
+    for byte in body { bytes.append(byte) }
+    return write_bytes<T>(writer, bytes)
+}
+
+package func write_response<T:IO.Writer>(
+    writer:&T,
+    response:@HTTP.Response,
+    include_body:bool
+) Result<void, HTTP.Error> {
+    var bytes:uint8[] = []
+    var reason = response.reason()
+    append_text(bytes, "HTTP/1.1 " + HTTP.decimal(response.status()) + " " + reason + "\r\n")
+    var headers = response.headers()
+    append_headers(bytes, headers)
+    let body = response.body()
+    var length = body.count()
+    if body_forbidden(response.status()) { length = 0 }
+    append_text(bytes, "Content-Length: " + HTTP.decimal(length) + "\r\n")
+    append_text(bytes, "Connection: close\r\n\r\n")
+    if include_body && !body_forbidden(response.status()) {
+        for byte in body { bytes.append(byte) }
+    }
+    return write_bytes<T>(writer, bytes)
+}
+
+func read_headers<T:IO.Reader>(
+    reader:&T,
+    limits:HTTP.Limits,
+    remaining:&int
+) Result<HTTP.Headers, HTTP.Error> {
+    if limits.maximum_header_bytes < 0 || limits.maximum_headers < 0 {
+        return Result<HTTP.Headers, HTTP.Error>.failure(HTTP.failure(
+            HTTP.ErrorKind.header_limit,
+            null,
+            "HTTP header limits must be non-negative"
+        ))
+    }
+    var headers = HTTP.Headers()
+    while true {
+        let line = try read_line<T>(reader, remaining, "HTTP header")
+        if line == "" { return Result<HTTP.Headers, HTTP.Error>.success(headers) }
+        if headers.count() >= limits.maximum_headers {
+            return Result<HTTP.Headers, HTTP.Error>.failure(HTTP.failure(
+                HTTP.ErrorKind.header_limit,
+                null,
+                "HTTP message exceeds maximum_headers"
+            ))
+        }
+        let bytes = UTF8.bytes(line)
+        var colon = -1
+        var index = 0
+        while index < bytes.count() {
+            if bytes[index] == 58 { colon = index; break }
+            index++
+        }
+        if colon <= 0 {
+            return Result<HTTP.Headers, HTTP.Error>.failure(HTTP.failure(
+                HTTP.ErrorKind.malformed_message,
+                null,
+                "HTTP header line is missing a field-name separator"
+            ))
+        }
+        index = 0
+        while index < colon {
+            if !HTTP.header_name_byte(bytes[index]) {
+                return Result<HTTP.Headers, HTTP.Error>.failure(HTTP.failure(
+                    HTTP.ErrorKind.malformed_message,
+                    null,
+                    "HTTP header name contains an invalid byte"
+                ))
+            }
+            index++
+        }
+        index = colon + 1
+        while index < bytes.count() {
+            let byte = bytes[index]
+            if (byte < 32 && byte != 9) || byte == 127 {
+                return Result<HTTP.Headers, HTTP.Error>.failure(HTTP.failure(
+                    HTTP.ErrorKind.malformed_message,
+                    null,
+                    "HTTP header value contains a forbidden control byte"
+                ))
+            }
+            index++
+        }
+        headers.append(bytes_text(bytes, 0, colon), HTTP.trim(bytes_text(bytes, colon + 1, bytes.count())))
+    }
+    panic("HTTP header parser terminated unexpectedly")
+}
+
+func read_body<T:IO.Reader>(
+    reader:&T,
+    headers:HTTP.Headers,
+    limits:HTTP.Limits,
+    close_delimited:bool
+) Result<uint8[], HTTP.Error> {
+    if limits.maximum_body_bytes < 0 {
+        return fail_bytes(HTTP.ErrorKind.body_limit, "maximum_body_bytes must be non-negative")
+    }
+    let framing = try body_framing(headers)
+    if framing.kind == 1 {
+        if framing.length > limits.maximum_body_bytes {
+            return fail_bytes(HTTP.ErrorKind.body_limit, "HTTP body exceeds maximum_body_bytes")
+        }
+        return read_count<T>(reader, framing.length)
+    }
+    if framing.kind == 2 { return read_chunked<T>(reader, limits) }
+    if close_delimited { return read_to_end<T>(reader, limits.maximum_body_bytes) }
+    return Result<uint8[], HTTP.Error>.success([])
+}
+
+func body_framing(headers:HTTP.Headers) Result<BodyFraming, HTTP.Error> {
+    let transfer_values = headers.get_all("Transfer-Encoding")
+    let length_values = headers.get_all("Content-Length")
+    if transfer_values.count() > 0 && length_values.count() > 0 {
+        return Result<BodyFraming, HTTP.Error>.failure(HTTP.failure(
+            HTTP.ErrorKind.malformed_message,
+            null,
+            "HTTP message cannot contain both Transfer-Encoding and Content-Length"
+        ))
+    }
+    if transfer_values.count() > 0 {
+        if transfer_values.count() != 1 || HTTP.ascii_lower(HTTP.trim(transfer_values[0])) != "chunked" {
+            return Result<BodyFraming, HTTP.Error>.failure(HTTP.failure(
+                HTTP.ErrorKind.unsupported_transfer,
+                null,
+                "only a final chunked transfer coding is supported"
+            ))
+        }
+        return Result<BodyFraming, HTTP.Error>.success(BodyFraming(kind:2, length:0))
+    }
+    if length_values.count() == 0 {
+        return Result<BodyFraming, HTTP.Error>.success(BodyFraming(kind:0, length:0))
+    }
+    var length = -1
+    for value in length_values {
+        let parsed = parse_decimal(HTTP.trim(value))
+        if parsed < 0 {
+            return Result<BodyFraming, HTTP.Error>.failure(HTTP.failure(
+                HTTP.ErrorKind.malformed_message,
+                null,
+                "Content-Length must be a non-negative decimal integer"
+            ))
+        }
+        if length >= 0 && length != parsed {
+            return Result<BodyFraming, HTTP.Error>.failure(HTTP.failure(
+                HTTP.ErrorKind.malformed_message,
+                null,
+                "repeated Content-Length values disagree"
+            ))
+        }
+        length = parsed
+    }
+    return Result<BodyFraming, HTTP.Error>.success(BodyFraming(kind:1, length:length))
+}
+
+func read_chunked<T:IO.Reader>(reader:&T, limits:HTTP.Limits) Result<uint8[], HTTP.Error> {
+    var result:uint8[] = []
+    var metadata_budget = limits.maximum_header_bytes
+    while true {
+        let line = try read_line<T>(reader, metadata_budget, "HTTP chunk size")
+        let size = parse_chunk_size(line)
+        if size < 0 {
+            return fail_bytes(HTTP.ErrorKind.malformed_message, "HTTP chunk size is not hexadecimal")
+        }
+        if size == 0 {
+            var trailer_count = 0
+            while true {
+                let trailer = try read_line<T>(reader, metadata_budget, "HTTP trailer")
+                if trailer == "" { return Result<uint8[], HTTP.Error>.success(result) }
+                trailer_count++
+                if trailer_count > limits.maximum_headers {
+                    return fail_bytes(HTTP.ErrorKind.header_limit, "HTTP trailers exceed maximum_headers")
+                }
+            }
+        }
+        if size > limits.maximum_body_bytes - result.count() {
+            return fail_bytes(HTTP.ErrorKind.body_limit, "HTTP chunked body exceeds maximum_body_bytes")
+        }
+        let chunk = try read_count<T>(reader, size)
+        for byte in chunk { result.append(byte) }
+        let ending = try read_count<T>(reader, 2)
+        if ending[0] != 13 || ending[1] != 10 {
+            return fail_bytes(HTTP.ErrorKind.malformed_message, "HTTP chunk is not followed by CRLF")
+        }
+    }
+    panic("HTTP chunk parser terminated unexpectedly")
+}
+
+func read_count<T:IO.Reader>(reader:&T, count:int) Result<uint8[], HTTP.Error> {
+    var result:uint8[] = []
+    var index = 0
+    while index < count {
+        match read_byte<T>(reader) {
+            success(value) => {
+                if value == null { return fail_bytes(HTTP.ErrorKind.closed, "HTTP stream ended before the declared body length") }
+                if let byte = value { result.append(byte) }
+            }
+            failure(error) => { return Result<uint8[], HTTP.Error>.failure(error) }
+        }
+        index++
+    }
+    return Result<uint8[], HTTP.Error>.success(result)
+}
+
+func read_to_end<T:IO.Reader>(reader:&T, maximum:int) Result<uint8[], HTTP.Error> {
+    var result:uint8[] = []
+    while true {
+        match read_byte<T>(reader) {
+            success(value) => {
+                if value == null { return Result<uint8[], HTTP.Error>.success(result) }
+                if result.count() >= maximum {
+                    return fail_bytes(HTTP.ErrorKind.body_limit, "close-delimited HTTP body exceeds maximum_body_bytes")
+                }
+                if let byte = value { result.append(byte) }
+            }
+            failure(error) => { return Result<uint8[], HTTP.Error>.failure(error) }
+        }
+    }
+    panic("HTTP close-delimited body reader terminated unexpectedly")
+}
+
+func read_line<T:IO.Reader>(reader:&T, remaining:&int, subject:str) Result<str, HTTP.Error> {
+    var bytes:uint8[] = []
+    while true {
+        if remaining <= 0 {
+            return Result<str, HTTP.Error>.failure(HTTP.failure(
+                HTTP.ErrorKind.header_limit,
+                subject,
+                "HTTP headers exceed maximum_header_bytes"
+            ))
+        }
+        var next:uint8? = null
+        match read_byte<T>(reader) {
+            success(value) => { next = value }
+            failure(error) => { return Result<str, HTTP.Error>.failure(error) }
+        }
+        if next == null {
+            return Result<str, HTTP.Error>.failure(HTTP.failure(
+                HTTP.ErrorKind.closed,
+                subject,
+                "HTTP stream ended before CRLF"
+            ))
+        }
+        remaining--
+        if let byte = next {
+            if byte == 10 {
+                if bytes.count() == 0 || bytes[bytes.count() - 1] != 13 {
+                    return Result<str, HTTP.Error>.failure(HTTP.failure(
+                        HTTP.ErrorKind.malformed_message,
+                        subject,
+                        "HTTP line uses LF without a preceding CR"
+                    ))
+                }
+                bytes.take_last()
+                return Result<str, HTTP.Error>.success(HTTP.text_from_bytes(bytes))
+            }
+            bytes.append(byte)
+        }
+    }
+    panic("HTTP line reader terminated unexpectedly")
+}
+
+func read_byte<T:IO.Reader>(reader:&T) Result<uint8?, HTTP.Error> {
+    var buffer:uint8[1]
+    var count = 0
+    {
+        var view = &buffer[0:1]
+        match reader.read(view) {
+            success(value) => { count = value }
+            failure(error) => {
+                return Result<uint8?, HTTP.Error>.failure(HTTP.failure(HTTP.ErrorKind.network, error.subject, error.detail))
+            }
+        }
+    }
+    if count == 0 { return Result<uint8?, HTTP.Error>.success(null) }
+    if count == 1 { return Result<uint8?, HTTP.Error>.success(buffer[0]) }
+    return Result<uint8?, HTTP.Error>.failure(HTTP.failure(
+        HTTP.ErrorKind.network,
+        null,
+        "reader returned a byte count outside its one-byte buffer"
+    ))
+}
+
+func write_bytes<T:IO.Writer>(writer:&T, bytes:uint8[]) Result<void, HTTP.Error> {
+    if bytes.count() == 0 { return Result<void, HTTP.Error>.success() }
+    match IO.write_all<T>(writer, @bytes[0:bytes.count()]) {
+        success => { return Result<void, HTTP.Error>.success() }
+        failure(error) => {
+            return Result<void, HTTP.Error>.failure(HTTP.failure(HTTP.ErrorKind.network, error.subject, error.detail))
+        }
+    }
+}
+
+func append_headers(bytes:&uint8[], headers:HTTP.Headers) {
+    for header in headers.values() {
+        let name = HTTP.ascii_lower(header.name)
+        if name == "content-length" || name == "transfer-encoding" || name == "connection" { continue }
+        append_text(bytes, header.name + ": " + header.value + "\r\n")
+    }
+}
+
+func append_text(bytes:&uint8[], text:str) {
+    for byte in UTF8.bytes(text) { bytes.append(byte) }
+}
+
+func split_spaces(value:str) str[] {
+    let bytes = UTF8.bytes(value)
+    var result:str[] = []
+    var start = 0
+    var index = 0
+    while index <= bytes.count() {
+        if index == bytes.count() || bytes[index] == 32 {
+            result.append(bytes_text(bytes, start, index))
+            start = index + 1
+        }
+        index++
+    }
+    return result
+}
+
+func bytes_text(bytes:uint8[], start:int, end:int) str {
+    if start >= end { return "" }
+    var result:uint8[] = []
+    var index = start
+    while index < end { result.append(bytes[index]); index++ }
+    return HTTP.text_from_bytes(result)
+}
+
+func valid_method(value:str) bool {
+    let bytes = UTF8.bytes(value)
+    if bytes.count() == 0 { return false }
+    for byte in bytes { if !HTTP.header_name_byte(byte) { return false } }
+    return true
+}
+
+func parse_decimal(value:str) int {
+    let bytes = UTF8.bytes(value)
+    if bytes.count() == 0 { return -1 }
+    var result = 0
+    for byte in bytes {
+        if byte < 48 || byte > 57 { return -1 }
+        if result > 214_748_364 { return -1 }
+        result = result * 10 + (byte - 48) as int
+    }
+    return result
+}
+
+func parse_chunk_size(value:str) int {
+    let bytes = UTF8.bytes(value)
+    var end = 0
+    while end < bytes.count() && bytes[end] != 59 { end++ }
+    var start = 0
+    while start < end && (bytes[start] == 32 || bytes[start] == 9) { start++ }
+    while end > start && (bytes[end - 1] == 32 || bytes[end - 1] == 9) { end-- }
+    if start == end { return -1 }
+    var result = 0
+    var index = start
+    while index < end {
+        let byte = bytes[index]
+        var digit = -1
+        if byte >= 48 && byte <= 57 { digit = (byte - 48) as int }
+        elif byte >= 65 && byte <= 70 { digit = (byte - 55) as int }
+        elif byte >= 97 && byte <= 102 { digit = (byte - 87) as int }
+        if digit < 0 || result > 134_217_727 { return -1 }
+        result = result * 16 + digit
+        index++
+    }
+    return result
+}
+
+func starts_with(value:str, prefix:str) bool {
+    let bytes = UTF8.bytes(value)
+    let expected = UTF8.bytes(prefix)
+    if bytes.count() < expected.count() { return false }
+    var index = 0
+    while index < expected.count() {
+        if bytes[index] != expected[index] { return false }
+        index++
+    }
+    return true
+}
+
+func body_forbidden(status:int) bool {
+    return (status >= 100 && status < 200) || status == 204 || status == 304
+}
+
+func fail_request(kind:HTTP.ErrorKind, detail:str) Result<HTTP.Request, HTTP.Error> {
+    return Result<HTTP.Request, HTTP.Error>.failure(HTTP.failure(kind, null, detail))
+}
+
+func fail_response(kind:HTTP.ErrorKind, detail:str) Result<HTTP.Response, HTTP.Error> {
+    return Result<HTTP.Response, HTTP.Error>.failure(HTTP.failure(kind, null, detail))
+}
+
+func fail_bytes(kind:HTTP.ErrorKind, detail:str) Result<uint8[], HTTP.Error> {
+    return Result<uint8[], HTTP.Error>.failure(HTTP.failure(kind, null, detail))
+}

@@ -1,0 +1,127 @@
+use HTTP
+use HTTP.Codec
+use STD.Error
+use STD.IO
+use STD.Text.UTF8
+
+class MemoryStream:IO.Reader, IO.Writer {
+    private let input:uint8[]
+    private var cursor:int
+    private var output:uint8[]
+
+    init(text:str) {
+        self.input = UTF8.bytes(text)
+        self.cursor = 0
+        self.output = []
+    }
+
+    func read(buffer:&uint8[..]) Result<int, Error> {
+        if self.cursor >= self.input.count() { return Result<int, Error>.success(0) }
+        var count = 0
+        while count < buffer.count() && self.cursor < self.input.count() {
+            buffer[count] = self.input[self.cursor]
+            count++
+            self.cursor++
+        }
+        return Result<int, Error>.success(count)
+    }
+
+    func write(buffer:@uint8[..]) Result<int, Error> {
+        for byte in buffer { self.output.append(byte) }
+        return Result<int, Error>.success(buffer.count())
+    }
+
+    func written_text() str {
+        if self.output.count() == 0 { return "" }
+        match UTF8.decode(@self.output[0:self.output.count()]) {
+            success(text) => { return text }
+            failure(error) => { panic("test output is not UTF-8") }
+        }
+    }
+}
+
+test "parse URL authority target and fragment" {
+    match HTTP.Url.parse("http://127.0.0.1:8080/docs?q=silex#section") {
+        failure(error) => { panic(error.detail) }
+        success(url) => {
+            assert(url.scheme == "http")
+            assert(url.host == "127.0.0.1")
+            assert(url.port == 8080)
+            assert(url.target == "/docs?q=silex")
+            assert(url.authority() == "127.0.0.1:8080")
+        }
+    }
+}
+
+test "preserve IPv6 brackets in HTTP authority" {
+    match HTTP.Url.parse("http://[::1]:8080/") {
+        failure(error) => { panic(error.detail) }
+        success(url) => {
+            assert(url.host == "::1")
+            assert(url.authority() == "[::1]:8080")
+        }
+    }
+}
+
+test "decode bounded request body" {
+    var stream = MemoryStream(
+        "POST /items HTTP/1.1\r\n" +
+        "Host: localhost\r\n" +
+        "Content-Length: 7\r\n\r\n" +
+        "payload"
+    )
+    var request = HTTP.Request.get("/")
+    match Codec.read_request(stream, HTTP.default_limits()) {
+        failure(error) => { panic(error.detail) }
+        success(value) => { request = value }
+    }
+    assert(request.method() == HTTP.Method.post)
+    assert(request.target() == "/items")
+    match request.text() {
+        failure(error) => { panic(error.detail) }
+        success(text) => { assert(text == "payload") }
+    }
+}
+
+test "decode chunked response" {
+    var stream = MemoryStream(
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" +
+        "5\r\nHello\r\n6\r\n Silex\r\n0\r\n\r\n"
+    )
+    var response = HTTP.Response(500)
+    match Codec.read_response(stream, HTTP.default_limits(), true) {
+        failure(error) => { panic(error.detail) }
+        success(value) => { response = value }
+    }
+    assert(response.status() == 200)
+    match response.text() {
+        failure(error) => { panic(error.detail) }
+        success(text) => { assert(text == "Hello Silex") }
+    }
+}
+
+test "encode response with canonical framing" {
+    var stream = MemoryStream("")
+    var response = HTTP.Response.text(200, "hello")
+    match Codec.write_response(stream, response, true) {
+        failure(error) => { panic(error.detail) }
+        success => {}
+    }
+    assert(
+        stream.written_text() ==
+            "HTTP/1.1 200 OK\r\n" +
+            "Content-Type: text/plain; charset=utf-8\r\n" +
+            "Content-Length: 5\r\n" +
+            "Connection: close\r\n\r\nhello"
+    )
+}
+
+test "reject conflicting response framing" {
+    var stream = MemoryStream(
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 1\r\n\r\n"
+    )
+    match Codec.read_response(stream, HTTP.default_limits(), true) {
+        success(response) => { panic("conflicting framing should fail") }
+        failure(error) => { assert(error.kind == HTTP.ErrorKind.malformed_message) }
+    }
+}
