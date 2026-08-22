@@ -240,7 +240,7 @@ upgrades and unsupported transfer codings.
 Outgoing buffered messages use `Content-Length`; streamed responses may use
 chunked transfer coding. Sessions use keep-alive while one-shot operations
 close their temporary pool after completion. Content decompression and cookie
-storage remain opt-in in version 0.5.
+storage remain opt-in in version 0.6.
 
 `Request.set_text`, `Response.text` and their `text()` projections use UTF-8.
 Raw byte bodies remain available for other media types.

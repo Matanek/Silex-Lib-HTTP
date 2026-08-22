@@ -1,8 +1,10 @@
 {
   "name": "HTTP",
-  "version": "0.5.0",
+  "version": "0.6.0",
+  "description": "Bounded HTTP/1.1 types, reusable clients, and application servers.",
+  "authors": ["Matanek"],
   "requires": {
-    "silex": ">=0.38.37"
+    "silex": ">=0.39.0"
   },
   "dependencies": {
     "STD": "^0.17.0"
