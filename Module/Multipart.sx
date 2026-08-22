@@ -1,0 +1,369 @@
+use HTTP.Error
+use HTTP.ErrorKind
+use HTTP.Header
+use HTTP.Headers
+use HTTP.byte_slice
+use HTTP.failure as http_error
+use HTTP.text_from_bytes
+use HTTP.trim
+use HTTP.Media.ContentDisposition
+use HTTP.Media.MediaType
+use HTTP.Media.contains_control
+use STD.IO
+use STD.Text.UTF8
+
+public struct MultipartOptions {
+    let maximum_header_bytes:int
+    let maximum_headers:int
+    let maximum_part_bytes:int
+}
+
+public struct MultipartPart {
+    var headers:Headers
+    let name:str?
+    let filename:str?
+    let content_type:MediaType?
+}
+
+public class MultipartReader<R:IO.Reader> {
+    private var input:R? = null
+    private let boundary:uint8[]
+    private let marker:uint8[]
+    private let limits:MultipartOptions
+    private var started:bool
+    private var active:bool
+    private var complete:bool
+    private var pending:uint8[]
+    private var part_total:int
+
+    package init(input:R, boundary:str, options:MultipartOptions) {
+        self.input = input
+        self.boundary = UTF8.bytes("--" + boundary)
+        self.marker = UTF8.bytes("\r\n--" + boundary)
+        self.limits = options
+        self.started = false
+        self.active = false
+        self.complete = false
+        self.pending = []
+        self.part_total = 0
+    }
+
+    func finished() bool { return self.complete }
+
+    func next() Result<MultipartPart?, Error> {
+        if self.active {
+            return Result<MultipartPart?, Error>.failure(http_error(
+                ErrorKind.body_stream, null, "multipart part must be consumed before requesting the next part"
+            ))
+        }
+        if self.complete { return Result<MultipartPart?, Error>.success(null) }
+        if !self.started {
+            var opening = ""
+            match self.read_line(self.limits.maximum_header_bytes) {
+                success(value) => { opening = value }
+                failure(error) => { return Result<MultipartPart?, Error>.failure(error) }
+            }
+            let expected = text_from_bytes(self.boundary)
+            if opening == expected + "--" {
+                self.complete = true
+                return Result<MultipartPart?, Error>.success(null)
+            }
+            if opening != expected {
+                return Result<MultipartPart?, Error>.failure(http_error(
+                    ErrorKind.malformed_message, null, "multipart body does not start with its boundary"
+                ))
+            }
+            self.started = true
+        }
+        var headers = Headers()
+        var consumed = 0
+        while true {
+            let remaining = self.limits.maximum_header_bytes - consumed
+            var line = ""
+            match self.read_line(remaining) {
+                success(value) => { line = value }
+                failure(error) => { return Result<MultipartPart?, Error>.failure(error) }
+            }
+            let line_bytes = UTF8.bytes(line)
+            consumed += line_bytes.count() + 2
+            if line == "" { break }
+            if headers.count() >= self.limits.maximum_headers {
+                return Result<MultipartPart?, Error>.failure(http_error(
+                    ErrorKind.header_limit, null, "multipart part exceeds maximum_headers"
+                ))
+            }
+            var header = Header(name:"", value:"")
+            match parse_part_header(line) {
+                success(value) => { header = value }
+                failure(error) => { return Result<MultipartPart?, Error>.failure(error) }
+            }
+            match headers.try_append(header.name, header.value) {
+                success => {}
+                failure(error) => { return Result<MultipartPart?, Error>.failure(error) }
+            }
+        }
+        var name:str? = null
+        var filename:str? = null
+        if let value = headers.get("Content-Disposition") {
+            match ContentDisposition.parse(value) {
+                success(disposition) => {
+                    name = disposition.name()
+                    filename = disposition.filename()
+                }
+                failure(error) => { return Result<MultipartPart?, Error>.failure(error) }
+            }
+        }
+        var content_type:MediaType? = null
+        if let value = headers.get("Content-Type") {
+            match MediaType.parse(value) {
+                success(media) => { content_type = media }
+                failure(error) => { return Result<MultipartPart?, Error>.failure(error) }
+            }
+        }
+        self.active = true
+        self.pending = []
+        self.part_total = 0
+        return Result<MultipartPart?, Error>.success(MultipartPart(
+            headers:headers,
+            name:name,
+            filename:filename,
+            content_type:content_type
+        ))
+    }
+
+    func read_part() Result<uint8[], Error> {
+        var result:uint8[] = []
+        while self.active {
+            var bytes:uint8[] = []
+            match self.read_part_chunk() {
+                success(value) => { bytes = value }
+                failure(error) => { return Result<uint8[], Error>.failure(error) }
+            }
+            for byte in bytes { result.append(byte) }
+        }
+        return Result<uint8[], Error>.success(result)
+    }
+
+    func read_part_chunk(maximum_bytes:int = 8_192) Result<uint8[], Error> {
+        if !self.active {
+            return Result<uint8[], Error>.failure(http_error(
+                ErrorKind.body_stream, null, "multipart reader has no active part"
+            ))
+        }
+        if maximum_bytes <= 0 {
+            return Result<uint8[], Error>.failure(http_error(
+                ErrorKind.body_stream, null, "multipart part chunk size must be positive"
+            ))
+        }
+        var output:uint8[] = []
+        while self.active && output.count() < maximum_bytes {
+            var byte:uint8? = null
+            match self.read_byte() {
+                success(value) => { byte = value }
+                failure(error) => { return Result<uint8[], Error>.failure(error) }
+            }
+            if let value = byte { self.pending.append(value) }
+            else {
+                return Result<uint8[], Error>.failure(http_error(
+                    ErrorKind.malformed_message, null, "multipart body ended before its closing boundary"
+                ))
+            }
+            while !is_prefix(self.pending, self.marker) {
+                let emitted = self.pending.take(0)
+                if self.part_total >= self.limits.maximum_part_bytes {
+                    return Result<uint8[], Error>.failure(http_error(
+                        ErrorKind.body_limit, null, "multipart part exceeds maximum_part_bytes"
+                    ))
+                }
+                output.append(emitted)
+                self.part_total++
+                if output.count() == maximum_bytes {
+                    return Result<uint8[], Error>.success(output)
+                }
+            }
+            if self.pending.count() == self.marker.count() {
+                var first:uint8 = 0
+                var second:uint8 = 0
+                match self.required_byte("multipart boundary suffix") {
+                    success(value) => { first = value }
+                    failure(error) => { return Result<uint8[], Error>.failure(error) }
+                }
+                match self.required_byte("multipart boundary suffix") {
+                    success(value) => { second = value }
+                    failure(error) => { return Result<uint8[], Error>.failure(error) }
+                }
+                if first == 45 && second == 45 {
+                    self.complete = true
+                    self.active = false
+                    self.pending = []
+                    return Result<uint8[], Error>.success(output)
+                }
+                if first == 13 && second == 10 {
+                    self.active = false
+                    self.pending = []
+                    return Result<uint8[], Error>.success(output)
+                }
+                return Result<uint8[], Error>.failure(http_error(
+                    ErrorKind.malformed_message, null, "multipart boundary has an invalid suffix"
+                ))
+            }
+        }
+        return Result<uint8[], Error>.success(output)
+    }
+
+    func discard_part() Result<void, Error> {
+        while self.active {
+            match self.read_part_chunk() {
+                success(bytes) => {}
+                failure(error) => { return Result<void, Error>.failure(error) }
+            }
+        }
+        return Result<void, Error>.success()
+    }
+
+    private func read_line(maximum_bytes:int) Result<str, Error> {
+        if maximum_bytes < 0 {
+            return Result<str, Error>.failure(http_error(
+                ErrorKind.header_limit, null, "multipart headers exceed maximum_header_bytes"
+            ))
+        }
+        var bytes:uint8[] = []
+        while bytes.count() <= maximum_bytes {
+            var byte:uint8 = 0
+            match self.required_byte("multipart line") {
+                success(value) => { byte = value }
+                failure(error) => { return Result<str, Error>.failure(error) }
+            }
+            if byte == 13 {
+                var ending:uint8 = 0
+                match self.required_byte("multipart line ending") {
+                    success(value) => { ending = value }
+                    failure(error) => { return Result<str, Error>.failure(error) }
+                }
+                if ending != 10 {
+                    return Result<str, Error>.failure(http_error(
+                        ErrorKind.malformed_message, null, "multipart line is not terminated by CRLF"
+                    ))
+                }
+                return Result<str, Error>.success(text_from_bytes(bytes))
+            }
+            if byte == 10 {
+                return Result<str, Error>.failure(http_error(
+                    ErrorKind.malformed_message, null, "multipart line contains a bare LF"
+                ))
+            }
+            bytes.append(byte)
+        }
+        return Result<str, Error>.failure(http_error(
+            ErrorKind.header_limit, null, "multipart line exceeds maximum_header_bytes"
+        ))
+    }
+
+    private func required_byte(subject:str) Result<uint8, Error> {
+        var value:uint8? = null
+        match self.read_byte() {
+            success(byte) => { value = byte }
+            failure(error) => { return Result<uint8, Error>.failure(error) }
+        }
+        if let byte = value { return Result<uint8, Error>.success(byte) }
+        return Result<uint8, Error>.failure(http_error(
+            ErrorKind.malformed_message, subject, "multipart stream ended unexpectedly"
+        ))
+    }
+
+    private func read_byte() Result<uint8?, Error> {
+        var buffer:uint8[1] = [0]
+        var view = &buffer[0:1]
+        if var input = self.input {
+            match input.read(view) {
+                success(count) => {
+                    if count == 0 { return Result<uint8?, Error>.success(null) }
+                    if count != 1 {
+                        return Result<uint8?, Error>.failure(http_error(
+                            ErrorKind.body_stream, null, "multipart reader violated the IO.Reader contract"
+                        ))
+                    }
+                    return Result<uint8?, Error>.success(view[0])
+                }
+                failure(error) => {
+                    return Result<uint8?, Error>.failure(http_error(
+                        ErrorKind.body_stream, error.subject, error.detail
+                    ))
+                }
+            }
+        }
+        return Result<uint8?, Error>.failure(http_error(
+            ErrorKind.closed, null, "multipart input is unavailable"
+        ))
+    }
+}
+
+public func default_multipart_options() MultipartOptions {
+    return MultipartOptions(
+        maximum_header_bytes:64 * 1024,
+        maximum_headers:64,
+        maximum_part_bytes:16 * 1024 * 1024
+    )
+}
+
+public func multipart<R:IO.Reader>(
+    input:R,
+    content_type:MediaType
+) Result<MultipartReader<R>, Error> {
+    return multipart(input, content_type, default_multipart_options())
+}
+
+public func multipart<R:IO.Reader>(
+    input:R,
+    content_type:MediaType,
+    options:MultipartOptions
+) Result<MultipartReader<R>, Error> {
+    if !content_type.matches("multipart", "form-data") {
+        return Result<MultipartReader<R>, Error>.failure(http_error(
+            ErrorKind.malformed_message, content_type.text(), "Content-Type is not multipart/form-data"
+        ))
+    }
+    if options.maximum_header_bytes < 0 || options.maximum_headers < 0 || options.maximum_part_bytes < 0 {
+        return Result<MultipartReader<R>, Error>.failure(http_error(
+            ErrorKind.invalid_configuration, null, "multipart limits must be non-negative"
+        ))
+    }
+    var boundary = ""
+    if let value = content_type.parameter("boundary") { boundary = value }
+    let boundary_bytes = UTF8.bytes(boundary)
+    if boundary == "" || boundary_bytes.count() > 70 || contains_control(boundary) {
+        return Result<MultipartReader<R>, Error>.failure(http_error(
+            ErrorKind.malformed_message, boundary, "multipart boundary is missing or invalid"
+        ))
+    }
+    return Result<MultipartReader<R>, Error>.success(MultipartReader<R>(input, boundary, options))
+}
+
+func parse_part_header(line:str) Result<Header, Error> {
+    let bytes = UTF8.bytes(line)
+    var colon = -1
+    var index = 0
+    while index < bytes.count() {
+        if bytes[index] == 58 { colon = index; break }
+        index++
+    }
+    if colon <= 0 {
+        return Result<Header, Error>.failure(http_error(
+            ErrorKind.malformed_message, line, "multipart header requires name: value"
+        ))
+    }
+    return Result<Header, Error>.success(Header(
+        name:byte_slice(bytes, 0, colon),
+        value:trim(byte_slice(bytes, colon + 1, bytes.count()))
+    ))
+}
+
+func is_prefix(candidate:uint8[], expected:uint8[]) bool {
+    if candidate.count() > expected.count() { return false }
+    var index = 0
+    while index < candidate.count() {
+        if candidate[index] != expected[index] { return false }
+        index++
+    }
+    return true
+}

@@ -1,0 +1,546 @@
+use HTTP
+use HTTP.Server.Transport
+use STD.Text.UTF8
+
+public struct Parameter {
+    let name:str
+    let value:str
+}
+
+public struct RouteLimits {
+    let maximum_body_bytes:int?
+    let maximum_headers:int?
+}
+
+public struct ApplicationError {
+    let status:int
+    let code:str
+    let detail:str
+}
+
+public class Context {
+    private var incoming_request:HTTP.Request? = null
+    private var incoming_body:Transport.IncomingBody? = null
+    private let route_parameters:Parameter[]
+    private let body_limit:int
+
+    package init(
+        request:@HTTP.Request,
+        body:Transport.IncomingBody,
+        parameters:Parameter[],
+        maximum_body_bytes:int
+    ) {
+        body.restrict(maximum_body_bytes)
+        self.incoming_request = request
+        self.incoming_body = body
+        self.route_parameters = parameters
+        self.body_limit = maximum_body_bytes
+    }
+
+    func request() HTTP.Request {
+        if var value = self.incoming_request { return value }
+        panic("HTTP application context request is unavailable")
+    }
+    func body() Transport.IncomingBody {
+        if var value = self.incoming_body { return value }
+        panic("HTTP application context body is unavailable")
+    }
+    func parameters() Parameter[] { return self.route_parameters }
+
+    func parameter(name:str) str? {
+        for parameter in self.route_parameters {
+            if parameter.name == name { return parameter.value }
+        }
+        return null
+    }
+
+    func read_body() Result<uint8[], HTTP.Error> {
+        if var value = self.incoming_body { return value.read_all(self.body_limit) }
+        return Result<uint8[], HTTP.Error>.failure(HTTP.failure(
+            HTTP.ErrorKind.closed, null, "request body is unavailable"
+        ))
+    }
+
+    func read_text() Result<str, HTTP.Error> {
+        var bytes:uint8[] = []
+        match self.read_body() {
+            success(value) => { bytes = value }
+            failure(error) => { return Result<str, HTTP.Error>.failure(error) }
+        }
+        if bytes.is_empty() { return Result<str, HTTP.Error>.success("") }
+        match UTF8.decode(@bytes[0:bytes.count()]) {
+            success(text) => { return Result<str, HTTP.Error>.success(text) }
+            failure(error) => {
+                return Result<str, HTTP.Error>.failure(HTTP.failure(
+                    HTTP.ErrorKind.invalid_text,
+                    self.request().path(),
+                    "request body is not valid UTF-8 at byte $(error.byte_offset)"
+                ))
+            }
+        }
+    }
+
+    package func exceeded_body_limit() bool {
+        if var value = self.incoming_body { return value.exceeded_limit() }
+        return false
+    }
+}
+
+class Route {
+    private let route_method:str
+    private let route_pattern:str
+    private var route_handler:func(@Context) HTTP.Response
+    private var route_limits:RouteLimits
+
+    init(
+        method:str,
+        pattern:str,
+        handler:func(@Context) HTTP.Response,
+        limits:RouteLimits
+    ) {
+        self.route_method = method
+        self.route_pattern = pattern
+        self.route_handler = handler
+        self.route_limits = limits
+    }
+
+    func method() str { return self.route_method }
+    func pattern() str { return self.route_pattern }
+    func limits() RouteLimits { return self.route_limits }
+    func set_limits(value:RouteLimits) { self.route_limits = value }
+    func handle(context:@Context) HTTP.Response { return self.route_handler(context) }
+}
+
+public class Middleware {
+    private var before_handler:func(@Context) Result<void, ApplicationError>
+    private var after_handler:func(@Context, @HTTP.Response) Result<void, ApplicationError>
+
+    init(
+        before:func(@Context) Result<void, ApplicationError>,
+        after:func(@Context, @HTTP.Response) Result<void, ApplicationError>
+    ) {
+        self.before_handler = before
+        self.after_handler = after
+    }
+
+    func before(context:@Context) Result<void, ApplicationError> {
+        return self.before_handler(context)
+    }
+
+    func after(
+        context:@Context,
+        response:@HTTP.Response
+    ) Result<void, ApplicationError> {
+        return self.after_handler(context, response)
+    }
+}
+
+public class Router {
+    private var routes:Route[]
+    private var middleware_stack:Middleware[]
+    private var error_handler:func(@Context, ApplicationError) HTTP.Response
+
+    init() {
+        self.routes = []
+        self.middleware_stack = []
+        self.error_handler = standard_error_handler
+    }
+
+    func route(
+        method:HTTP.Method,
+        pattern:str,
+        handler:func(@Context) HTTP.Response
+    ) Result<void, HTTP.Error> {
+        match validate_route_pattern(pattern) {
+            success => {}
+            failure(error) => { return Result<void, HTTP.Error>.failure(error) }
+        }
+        let method_name = HTTP.method_text(method)
+        for route in self.routes {
+            if route.method() == method_name && route.pattern() == pattern {
+                return Result<void, HTTP.Error>.failure(HTTP.failure(
+                    HTTP.ErrorKind.invalid_configuration,
+                    method_name + " " + pattern,
+                    "HTTP route is already registered"
+                ))
+            }
+        }
+        self.routes.append(Route(
+            method:method_name,
+            pattern:pattern,
+            handler:handler,
+            limits:default_route_limits()
+        ))
+        return Result<void, HTTP.Error>.success()
+    }
+
+    func limit(
+        method:HTTP.Method,
+        pattern:str,
+        limits:RouteLimits
+    ) Result<void, HTTP.Error> {
+        match validate_route_limits(limits) {
+            success => {}
+            failure(error) => { return Result<void, HTTP.Error>.failure(error) }
+        }
+        let method_name = HTTP.method_text(method)
+        for route in self.routes {
+            if route.method() == method_name && route.pattern() == pattern {
+                route.set_limits(limits)
+                return Result<void, HTTP.Error>.success()
+            }
+        }
+        return Result<void, HTTP.Error>.failure(HTTP.failure(
+            HTTP.ErrorKind.invalid_configuration,
+            method_name + " " + pattern,
+            "HTTP route must be registered before configuring its limits"
+        ))
+    }
+
+    func get(
+        pattern:str,
+        handler:func(@Context) HTTP.Response
+    ) Result<void, HTTP.Error> { return self.route(HTTP.Method.get, pattern, handler) }
+
+    func head(
+        pattern:str,
+        handler:func(@Context) HTTP.Response
+    ) Result<void, HTTP.Error> { return self.route(HTTP.Method.head, pattern, handler) }
+
+    func post(
+        pattern:str,
+        handler:func(@Context) HTTP.Response
+    ) Result<void, HTTP.Error> { return self.route(HTTP.Method.post, pattern, handler) }
+
+    func put(
+        pattern:str,
+        handler:func(@Context) HTTP.Response
+    ) Result<void, HTTP.Error> { return self.route(HTTP.Method.put, pattern, handler) }
+
+    func patch(
+        pattern:str,
+        handler:func(@Context) HTTP.Response
+    ) Result<void, HTTP.Error> { return self.route(HTTP.Method.patch, pattern, handler) }
+
+    func delete(
+        pattern:str,
+        handler:func(@Context) HTTP.Response
+    ) Result<void, HTTP.Error> { return self.route(HTTP.Method.delete, pattern, handler) }
+
+    func options(
+        pattern:str,
+        handler:func(@Context) HTTP.Response
+    ) Result<void, HTTP.Error> { return self.route(HTTP.Method.options, pattern, handler) }
+
+    func add_middleware(value:Middleware) {
+        self.middleware_stack.append(value)
+    }
+
+    func on_error(handler:func(@Context, ApplicationError) HTTP.Response) {
+        self.error_handler = handler
+    }
+
+    func handle(request:@HTTP.Request, body:Transport.IncomingBody) HTTP.Response {
+        let method_name = HTTP.method_text(request.method())
+        let path = request.path()
+        var allowed:str[] = []
+        for route in self.routes {
+            if let parameters = match_route(route.pattern(), path) {
+                if route.method() != method_name {
+                    append_unique(allowed, route.method())
+                    continue
+                }
+                let limits = route.limits()
+                var context = Context(
+                    request,
+                    body,
+                    parameters,
+                    route_body_limit(limits)
+                )
+                if context.exceeded_body_limit() {
+                    return self.render_error(
+                        context,
+                        application_error(413, "body_limit", "request exceeds the route body limit")
+                    )
+                }
+                if request.headers().count() > route_header_limit(limits) {
+                    return self.render_error(
+                        context,
+                        application_error(431, "header_limit", "request exceeds the route header limit")
+                    )
+                }
+                for middleware in self.middleware_stack {
+                    match middleware.before(context) {
+                        success => {}
+                        failure(error) => { return self.render_error(context, error) }
+                    }
+                }
+                var response = route.handle(context)
+                var index = self.middleware_stack.count() - 1
+                while index >= 0 && !self.middleware_stack.is_empty() {
+                    match self.middleware_stack[index].after(context, response) {
+                        success => {}
+                        failure(error) => { return self.render_error(context, error) }
+                    }
+                    index--
+                }
+                return response
+            }
+        }
+        var context = Context(
+            request,
+            body,
+            [],
+            HTTP.default_limits().maximum_body_bytes
+        )
+        if !allowed.is_empty() {
+            var response = self.render_error(context, application_error(
+                405, "method_not_allowed", "the request method is not allowed for this route"
+            ))
+            response.headers().set("Allow", join_methods(allowed))
+            return response
+        }
+        return self.render_error(context, application_error(
+            404, "route_not_found", "no route matches the request method and path"
+        ))
+    }
+
+    private func render_error(context:@Context, error:ApplicationError) HTTP.Response {
+        return self.error_handler(context, error)
+    }
+}
+
+public class Application {
+    private var application_router:Router
+    private var accepting:bool
+
+    init(router:Router) {
+        self.application_router = router
+        self.accepting = false
+    }
+
+    func router() Router { return self.application_router }
+    func running() bool { return self.accepting }
+    func stop() { self.accepting = false }
+
+    func serve(listener:Transport.Listener) Result<void, HTTP.Error> {
+        if self.accepting {
+            return Result<void, HTTP.Error>.failure(HTTP.failure(
+                HTTP.ErrorKind.invalid_configuration, null, "HTTP application is already serving"
+            ))
+        }
+        self.accepting = true
+        var server = listener
+        var result = server.serve_stream_while(self.serve_response, self.should_continue)
+        self.accepting = false
+        return result
+    }
+
+    package func serve_response(
+        request:@HTTP.Request,
+        body:Transport.IncomingBody
+    ) HTTP.Response {
+        var response = self.application_router.handle(request, body)
+        if !self.accepting { response.headers().set("Connection", "close") }
+        return response
+    }
+
+    package func should_continue() bool { return self.accepting }
+}
+
+public func default_route_limits() RouteLimits {
+    return RouteLimits(maximum_body_bytes:null, maximum_headers:null)
+}
+
+public func application_error(status:int, code:str, detail:str) ApplicationError {
+    var normalized = status
+    if normalized < 400 || normalized > 599 { normalized = 500 }
+    return ApplicationError(status:normalized, code:code, detail:detail)
+}
+
+public func standardized_error(error:ApplicationError) HTTP.Response {
+    var response = HTTP.Response.text(error.status, error.detail)
+    response.headers().set("X-Error-Code", error.code)
+    return response
+}
+
+func standard_error_handler(context:@Context, error:ApplicationError) HTTP.Response {
+    return standardized_error(error)
+}
+
+func append_unique(values:&str[], value:str) {
+    for existing in values {
+        if existing == value { return }
+    }
+    values.append(value)
+}
+
+func join_methods(values:str[]) str {
+    var result = ""
+    for value in values {
+        if result != "" { result += ", " }
+        result += value
+    }
+    return result
+}
+
+func validate_route_limits(limits:RouteLimits) Result<void, HTTP.Error> {
+    if let maximum = limits.maximum_body_bytes {
+        if maximum < 0 {
+            return Result<void, HTTP.Error>.failure(HTTP.failure(
+                HTTP.ErrorKind.invalid_configuration, null, "route body limit must be non-negative"
+            ))
+        }
+    }
+    if let maximum = limits.maximum_headers {
+        if maximum < 0 {
+            return Result<void, HTTP.Error>.failure(HTTP.failure(
+                HTTP.ErrorKind.invalid_configuration, null, "route header limit must be non-negative"
+            ))
+        }
+    }
+    return Result<void, HTTP.Error>.success()
+}
+
+func route_body_limit(limits:RouteLimits) int {
+    if let maximum = limits.maximum_body_bytes { return maximum }
+    return HTTP.default_limits().maximum_body_bytes
+}
+
+func route_header_limit(limits:RouteLimits) int {
+    if let maximum = limits.maximum_headers { return maximum }
+    return HTTP.default_limits().maximum_headers
+}
+
+func validate_route_pattern(pattern:str) Result<void, HTTP.Error> {
+    if pattern == "" || UTF8.bytes(pattern)[0] != 47 {
+        return Result<void, HTTP.Error>.failure(HTTP.failure(
+            HTTP.ErrorKind.invalid_configuration, pattern, "route pattern must start with /"
+        ))
+    }
+    let segments = path_segments(pattern)
+    var names:str[] = []
+    var index = 0
+    while index < segments.count() {
+        let segment = segments[index]
+        let bytes = UTF8.bytes(segment)
+        if !bytes.is_empty() && (bytes[0] == 58 || bytes[0] == 42) {
+            if bytes.count() == 1 {
+                return Result<void, HTTP.Error>.failure(HTTP.failure(
+                    HTTP.ErrorKind.invalid_configuration, pattern, "route parameter requires a name"
+                ))
+            }
+            let name = HTTP.byte_slice(bytes, 1, bytes.count())
+            for existing in names {
+                if existing == name {
+                    return Result<void, HTTP.Error>.failure(HTTP.failure(
+                        HTTP.ErrorKind.invalid_configuration, pattern, "route parameter name is repeated"
+                    ))
+                }
+            }
+            names.append(name)
+            if bytes[0] == 42 && index != segments.count() - 1 {
+                return Result<void, HTTP.Error>.failure(HTTP.failure(
+                    HTTP.ErrorKind.invalid_configuration, pattern, "wildcard route parameter must be last"
+                ))
+            }
+        }
+        index++
+    }
+    return Result<void, HTTP.Error>.success()
+}
+
+func match_route(pattern:str, path:str) Parameter[]? {
+    let expected = path_segments(pattern)
+    let actual = path_segments(path)
+    var result:Parameter[] = []
+    var index = 0
+    while index < expected.count() {
+        let pattern_segment = expected[index]
+        let bytes = UTF8.bytes(pattern_segment)
+        if !bytes.is_empty() && bytes[0] == 42 {
+            var captured = ""
+            var cursor = index
+            while cursor < actual.count() {
+                if captured != "" { captured += "/" }
+                captured += actual[cursor]
+                cursor++
+            }
+            let name = HTTP.byte_slice(bytes, 1, bytes.count())
+            result.append(Parameter(name:name, value:captured))
+            return result
+        }
+        if index >= actual.count() { return null }
+        if !bytes.is_empty() && bytes[0] == 58 {
+            let name = HTTP.byte_slice(bytes, 1, bytes.count())
+            result.append(Parameter(name:name, value:actual[index]))
+        } elif pattern_segment != actual[index] { return null }
+        index++
+    }
+    if index != actual.count() { return null }
+    return result
+}
+
+func path_segments(path:str) str[] {
+    let bytes = UTF8.bytes(path)
+    var result:str[] = []
+    var start = 1
+    var index = 1
+    while index <= bytes.count() {
+        if index == bytes.count() || bytes[index] == 47 {
+            if index > start {
+                let raw = HTTP.byte_slice(bytes, start, index)
+                match decode_path_segment(raw) {
+                    success(value) => { result.append(value) }
+                    failure(error) => { return [] }
+                }
+            }
+            start = index + 1
+        }
+        index++
+    }
+    return result
+}
+
+func decode_path_segment(value:str) Result<str, HTTP.Error> {
+    let bytes = UTF8.bytes(value)
+    var decoded:uint8[] = []
+    var index = 0
+    while index < bytes.count() {
+        if bytes[index] == 37 {
+            if index + 2 >= bytes.count() {
+                return Result<str, HTTP.Error>.failure(HTTP.failure(
+                    HTTP.ErrorKind.invalid_url, value, "path percent escape is incomplete"
+                ))
+            }
+            let high = hex_digit(bytes[index + 1])
+            let low = hex_digit(bytes[index + 2])
+            if high < 0 || low < 0 {
+                return Result<str, HTTP.Error>.failure(HTTP.failure(
+                    HTTP.ErrorKind.invalid_url, value, "path percent escape is not hexadecimal"
+                ))
+            }
+            decoded.append((high * 16 + low) as uint8)
+            index += 3
+            continue
+        }
+        decoded.append(bytes[index])
+        index++
+    }
+    if decoded.is_empty() { return Result<str, HTTP.Error>.success("") }
+    match UTF8.decode(@decoded[0:decoded.count()]) {
+        success(text) => { return Result<str, HTTP.Error>.success(text) }
+        failure(error) => {
+            return Result<str, HTTP.Error>.failure(HTTP.failure(
+                HTTP.ErrorKind.invalid_url, value, "decoded path segment is not valid UTF-8"
+            ))
+        }
+    }
+}
+
+func hex_digit(byte:uint8) int {
+    if byte >= 48 && byte <= 57 { return (byte - 48) as int }
+    if byte >= 65 && byte <= 70 { return (byte - 55) as int }
+    if byte >= 97 && byte <= 102 { return (byte - 87) as int }
+    return -1
+}

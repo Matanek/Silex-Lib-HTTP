@@ -1,6 +1,6 @@
 # HTTP for Silex
 
-`HTTP` provides a bounded HTTP/1.1 model, client and synchronous server. Body
+`HTTP` provides a bounded HTTP/1.1 model, reusable client and application server. Body
 formats remain independent: pass UTF-8 text to `JSON.parse`, `HTML.parse`,
 `YAML.parse` or another package instead of coupling those packages to HTTP.
 
@@ -99,11 +99,20 @@ after DNS resolution. Every redirect is resolved and checked again. HTTPS
 connects to the exact approved endpoint while retaining the original hostname
 for certificate verification.
 
-The bootstrap socket backend still reports a structured unsupported network
-error when a non-null connect timeout is requested; it is never silently
-ignored. Read/write socket timeouts and HTTP total deadlines are enforced.
-Persistent sessions reduce repeated connection attempts but do not remove this
-limitation from the first connection to an origin.
+Connection timeouts are enforced by the socket boundary on macOS ARM64, Linux
+x86-64, Windows x86-64 and Windows ARM64. Read/write socket timeouts and HTTP
+total deadlines are enforced independently, so a slow connect, slow peer and
+long redirect chain remain separate budgets.
+
+## Proxies
+
+`Client.Proxy.parse("http://proxy.example:8080")` configures an HTTP proxy.
+Attach Basic or Bearer proxy authentication to that value, then pass it through
+`Client.Options.with_proxy`. Plain HTTP requests use absolute targets; HTTPS
+requests establish a `CONNECT` tunnel before certificate-verifying TLS is
+opened for the origin. `Proxy-Authorization` is never forwarded to the HTTPS
+origin. The optional public-network policy checks both the proxy and every
+origin, including redirected destinations.
 
 ## URLs and query parameters
 
@@ -138,6 +147,26 @@ var server = try Server.listen("127.0.0.1", 8080)
 try server.serve(handle)
 ```
 
+For application-level routing, `HTTP.Server.Router` registers handlers by
+method and path. `:name` captures one path segment and a final `*name` captures
+the remainder. Middleware runs in registration order before a route and in
+reverse order after it. Per-route body/header limits, custom error rendering,
+and standardized `404`, `405` and `431` responses are built in.
+
+```sx
+func show(context:@Server.Context) HTTP.Response {
+    if let id = context.parameter("id") { return HTTP.Response.text(200, id) }
+    return HTTP.Response.text(400, "missing id")
+}
+
+var router = Server.Router()
+try router.get("/items/:id", show)
+var application = Server.Application(router)
+var listener = try Server.listen("127.0.0.1", 8080,
+    Server.default_options().with_workers(4))
+try application.serve(listener)
+```
+
 `serve_once` exposes the error from one controlled connection. Long-running
 `serve` loops isolate malformed, prematurely closed and oversized connections;
 when possible they send `400`, `413`, `431` or `501` and continue accepting.
@@ -148,8 +177,24 @@ the accepted peer endpoint.
 `serve_while` checks an application predicate between connections and returns
 successfully when it becomes false. It does not interrupt an accept already in
 progress; applications needing periodic checks can configure an accept timeout.
-The server remains intentionally synchronous and does not claim event-driven or
-concurrent I/O.
+`Application.stop()` performs the same graceful transition and marks the current
+response `Connection: close`. One worker remains the low-overhead default;
+`with_workers` opts into a bounded `STD.Threading.Executor` pool. The server is
+threaded rather than event-driven.
+
+## Forms, media types and content coding
+
+`HTTP.Form` parses and writes `application/x-www-form-urlencoded` values.
+`HTTP.Media.MediaType` parses `Content-Type`, including quoted parameters and
+`charset`; `ContentDisposition` parses form/download metadata and safely builds
+attachments. `HTTP.Multipart.MultipartReader` consumes `multipart/form-data`
+progressively from any `STD.IO.Reader`, so file parts do not require buffering
+the complete request.
+
+`HTTP.ContentCoding.decompress` decodes bounded `gzip` and `deflate` bodies via
+`STD.Compression`. `decompress_response` also normalizes the affected response
+headers. Decompression is explicit: the client never expands an untrusted body
+without an application-selected output limit.
 
 ## Streaming bodies
 
@@ -194,8 +239,8 @@ upgrades and unsupported transfer codings.
 
 Outgoing buffered messages use `Content-Length`; streamed responses may use
 chunked transfer coding. Sessions use keep-alive while one-shot operations
-close their temporary pool after completion. Automatic content decompression
-and persistent cookie storage are not implicit in version 0.4.
+close their temporary pool after completion. Content decompression and cookie
+storage remain opt-in in version 0.5.
 
 `Request.set_text`, `Response.text` and their `text()` projections use UTF-8.
 Raw byte bodies remain available for other media types.

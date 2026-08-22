@@ -4,9 +4,11 @@ use STD.IO
 use STD.Network
 use STD.Network.TCP
 use STD.Text.UTF8
+use STD.Threading
 
 public struct Options {
     let backlog:int
+    let worker_count:int
     let limits:HTTP.Limits
     let accept_timeout_milliseconds:int?
     let read_timeout_milliseconds:int?
@@ -16,6 +18,7 @@ public struct Options {
     func with_limits(value:HTTP.Limits) Options {
         return Options(
             backlog:self.backlog,
+            worker_count:self.worker_count,
             limits:value,
             accept_timeout_milliseconds:self.accept_timeout_milliseconds,
             read_timeout_milliseconds:self.read_timeout_milliseconds,
@@ -27,6 +30,19 @@ public struct Options {
     func with_backlog(value:int) Options {
         return Options(
             backlog:value,
+            worker_count:self.worker_count,
+            limits:self.limits,
+            accept_timeout_milliseconds:self.accept_timeout_milliseconds,
+            read_timeout_milliseconds:self.read_timeout_milliseconds,
+            write_timeout_milliseconds:self.write_timeout_milliseconds,
+            connection_timeout_milliseconds:self.connection_timeout_milliseconds
+        )
+    }
+
+    func with_workers(count:int) Options {
+        return Options(
+            backlog:self.backlog,
+            worker_count:count,
             limits:self.limits,
             accept_timeout_milliseconds:self.accept_timeout_milliseconds,
             read_timeout_milliseconds:self.read_timeout_milliseconds,
@@ -38,6 +54,7 @@ public struct Options {
     func with_accept_timeout(milliseconds:int?) Options {
         return Options(
             backlog:self.backlog,
+            worker_count:self.worker_count,
             limits:self.limits,
             accept_timeout_milliseconds:milliseconds,
             read_timeout_milliseconds:self.read_timeout_milliseconds,
@@ -49,6 +66,7 @@ public struct Options {
     func with_read_timeout(milliseconds:int?) Options {
         return Options(
             backlog:self.backlog,
+            worker_count:self.worker_count,
             limits:self.limits,
             accept_timeout_milliseconds:self.accept_timeout_milliseconds,
             read_timeout_milliseconds:milliseconds,
@@ -60,6 +78,7 @@ public struct Options {
     func with_write_timeout(milliseconds:int?) Options {
         return Options(
             backlog:self.backlog,
+            worker_count:self.worker_count,
             limits:self.limits,
             accept_timeout_milliseconds:self.accept_timeout_milliseconds,
             read_timeout_milliseconds:self.read_timeout_milliseconds,
@@ -71,6 +90,7 @@ public struct Options {
     func with_connection_timeout(milliseconds:int?) Options {
         return Options(
             backlog:self.backlog,
+            worker_count:self.worker_count,
             limits:self.limits,
             accept_timeout_milliseconds:self.accept_timeout_milliseconds,
             read_timeout_milliseconds:self.read_timeout_milliseconds,
@@ -82,6 +102,7 @@ public struct Options {
     func without_timeouts() Options {
         return Options(
             backlog:self.backlog,
+            worker_count:self.worker_count,
             limits:self.limits,
             accept_timeout_milliseconds:null,
             read_timeout_milliseconds:null,
@@ -94,6 +115,7 @@ public struct Options {
 public func default_options() Options {
     return Options(
         backlog:128,
+        worker_count:1,
         limits:HTTP.default_limits(),
         accept_timeout_milliseconds:null,
         read_timeout_milliseconds:30_000,
@@ -109,6 +131,8 @@ public class IncomingBody {
     private var remaining:int
     private var chunk_remaining:int
     private var total:int
+    private var maximum_body_bytes:int
+    private var body_limit_exceeded:bool
     private var metadata_budget:int
     private var complete:bool
     private var deadline:HTTP.DeadlineBudget?
@@ -125,6 +149,8 @@ public class IncomingBody {
         self.remaining = framing.length
         self.chunk_remaining = 0
         self.total = 0
+        self.maximum_body_bytes = limits.maximum_body_bytes
+        self.body_limit_exceeded = false
         self.metadata_budget = limits.maximum_header_bytes
         self.complete = framing.kind == 0 || (framing.kind == 1 && framing.length == 0)
         self.deadline = deadline
@@ -156,6 +182,17 @@ public class IncomingBody {
 
     func finished() bool { return self.complete }
 
+    package func restrict(maximum_bytes:int) {
+        if maximum_bytes < self.maximum_body_bytes {
+            self.maximum_body_bytes = maximum_bytes
+        }
+        if self.framing_kind == 1 && self.remaining > self.maximum_body_bytes - self.total {
+            self.body_limit_exceeded = true
+        }
+    }
+
+    package func exceeded_limit() bool { return self.body_limit_exceeded }
+
     func read(maximum_bytes:int = 8_192) Result<uint8[], HTTP.Error> {
         if maximum_bytes <= 0 {
             return Result<uint8[], HTTP.Error>.failure(HTTP.failure(
@@ -163,8 +200,16 @@ public class IncomingBody {
             ))
         }
         if self.complete { return Result<uint8[], HTTP.Error>.success([]) }
+        if self.body_limit_exceeded || self.total >= self.maximum_body_bytes {
+            self.body_limit_exceeded = true
+            return Result<uint8[], HTTP.Error>.failure(route_body_limit_error())
+        }
         if var stream = self.connection {
             if self.framing_kind == 1 {
+                if self.remaining > self.maximum_body_bytes - self.total {
+                    self.body_limit_exceeded = true
+                    return Result<uint8[], HTTP.Error>.failure(route_body_limit_error())
+                }
                 var count = self.remaining
                 if count > maximum_bytes { count = maximum_bytes }
                 var bytes:uint8[] = []
@@ -187,12 +232,26 @@ public class IncomingBody {
     }
 
     func read_all() Result<uint8[], HTTP.Error> {
+        return self.read_all(self.maximum_body_bytes)
+    }
+
+    func read_all(maximum_bytes:int) Result<uint8[], HTTP.Error> {
+        if maximum_bytes < 0 {
+            return Result<uint8[], HTTP.Error>.failure(HTTP.failure(
+                HTTP.ErrorKind.body_limit, null, "incoming body limit must be non-negative"
+            ))
+        }
+        self.restrict(maximum_bytes)
         var result:uint8[] = []
         while !self.complete {
             var bytes:uint8[] = []
             match self.read() {
                 success(value) => { bytes = value }
                 failure(error) => { return Result<uint8[], HTTP.Error>.failure(error) }
+            }
+            if bytes.count() > maximum_bytes - result.count() {
+                self.body_limit_exceeded = true
+                return Result<uint8[], HTTP.Error>.failure(route_body_limit_error())
             }
             for byte in bytes { result.append(byte) }
         }
@@ -207,6 +266,15 @@ public class IncomingBody {
             }
         }
         return Result<void, HTTP.Error>.success()
+    }
+
+    package func discard_transport() Result<void, HTTP.Error> {
+        let violated = self.body_limit_exceeded
+        self.maximum_body_bytes = self.limits.maximum_body_bytes
+        self.body_limit_exceeded = false
+        var result = self.discard()
+        self.body_limit_exceeded = violated
+        return result
     }
 
     private func read_chunk(stream:TCP.Stream, maximum_bytes:int) Result<uint8[], HTTP.Error> {
@@ -232,10 +300,9 @@ public class IncomingBody {
                 self.complete = true
                 return Result<uint8[], HTTP.Error>.success([])
             }
-            if size > self.limits.maximum_body_bytes - self.total {
-                return Result<uint8[], HTTP.Error>.failure(HTTP.failure(
-                    HTTP.ErrorKind.body_limit, null, "HTTP chunked body exceeds maximum_body_bytes"
-                ))
+            if size > self.maximum_body_bytes - self.total {
+                self.body_limit_exceeded = true
+                return Result<uint8[], HTTP.Error>.failure(route_body_limit_error())
             }
             self.chunk_remaining = size
         }
@@ -506,6 +573,9 @@ public class Listener {
         handler:func(@HTTP.Request, IncomingBody) HTTP.Response,
         continue_serving:func() bool
     ) Result<void, HTTP.Error> {
+        if self.options.worker_count > 1 {
+            return self.serve_stream_workers_while(handler, continue_serving)
+        }
         while continue_serving() {
             if var socket = self.socket {
                 var accepted = try accept(socket, self.options)
@@ -523,6 +593,42 @@ public class Listener {
                 ))
             }
         }
+        return Result<void, HTTP.Error>.success()
+    }
+
+    private func serve_stream_workers_while(
+        handler:func(@HTTP.Request, IncomingBody) HTTP.Response,
+        continue_serving:func() bool
+    ) Result<void, HTTP.Error> {
+        var executor = Threading.Executor(self.options.worker_count)
+        var pending:Threading.JobHandle<StreamConnectionJob>[] = []
+        var first_error:HTTP.Error? = null
+        let maximum_pending = self.options.worker_count * 2
+        while continue_serving() && first_error == null {
+            if pending.count() >= maximum_pending {
+                var completed = pending.take(0).complete()
+                if let error = completed.error() { first_error = error }
+                continue
+            }
+            if var socket = self.socket {
+                var accepted = try accept(socket, self.options)
+                pending.append(executor.submit(StreamConnectionJob(
+                    connection:accepted.stream,
+                    peer:accepted.peer,
+                    options:self.options,
+                    handler:handler
+                )))
+            } else {
+                first_error = HTTP.failure(HTTP.ErrorKind.closed, null, "HTTP listener is closed")
+            }
+        }
+        while !pending.is_empty() {
+            var completed = pending.take(0).complete()
+            if first_error == null {
+                if let error = completed.error() { first_error = error }
+            }
+        }
+        if let error = first_error { return Result<void, HTTP.Error>.failure(error) }
         return Result<void, HTTP.Error>.success()
     }
 
@@ -629,6 +735,29 @@ public func listen(host:str, port:uint16, options:Options) Result<Listener, HTTP
     }
 }
 
+struct StreamConnectionJob:Threading.Job {
+    var connection:TCP.Stream?
+    let peer:Network.Endpoint
+    let options:Options
+    var handler:func(@HTTP.Request, IncomingBody) HTTP.Response
+    var execution_error:HTTP.Error? = null
+
+    func execute() {
+        if var stream = self.connection {
+            self.connection = null
+            match serve_stream_connection(stream, self.peer, self.options, self.handler, true) {
+                success => {}
+                failure(error) => {
+                    if !connection_error(error) { self.execution_error = error }
+                }
+            }
+            close_stream(stream)
+        }
+    }
+
+    func error() HTTP.Error? { return self.execution_error }
+}
+
 func serve_connection(
     stream:TCP.Stream,
     peer:Network.Endpoint,
@@ -708,12 +837,21 @@ func serve_stream_connection(
         }
         if var incoming = body {
             var response = handler(request, incoming)
-            match incoming.discard() {
+            let route_limit_exceeded = incoming.exceeded_limit()
+            var discarded = Result<void, HTTP.Error>.success()
+            if route_limit_exceeded {
+                discarded = incoming.discard_transport()
+            } else { discarded = incoming.discard() }
+            match discarded {
                 success => {}
-                failure(error) => { return fail_connection(connection, error, deadline) }
+                failure(error) => {
+                    if error.kind == HTTP.ErrorKind.body_limit {
+                        response = HTTP.Response.text(413, error.detail)
+                    } else { return fail_connection(connection, error, deadline) }
+                }
             }
             let keep = persistent && request_keeps_connection(request.headers()) &&
-                !response_closes_connection(response.headers())
+                !response_closes_connection(response.headers()) && !route_limit_exceeded
             set_response_connection(response, keep)
             match Codec.write_response<TCP.Stream>(
                 connection, response, request.method() != HTTP.Method.head, deadline
@@ -807,6 +945,10 @@ func fail_connection(
     return Result<void, HTTP.Error>.failure(error)
 }
 
+func route_body_limit_error() HTTP.Error {
+    return HTTP.failure(HTTP.ErrorKind.body_limit, null, "HTTP body exceeds the route limit")
+}
+
 func request_keeps_connection(headers:HTTP.Headers) bool {
     return !connection_has_token(headers, "close")
 }
@@ -859,9 +1001,9 @@ func connection_error(error:HTTP.Error) bool {
 }
 
 func validate_options(options:Options) Result<void, HTTP.Error> {
-    if options.backlog <= 0 {
+    if options.backlog <= 0 || options.worker_count <= 0 {
         return Result<void, HTTP.Error>.failure(HTTP.failure(
-            HTTP.ErrorKind.invalid_configuration, null, "HTTP server backlog must be positive"
+            HTTP.ErrorKind.invalid_configuration, null, "HTTP server backlog and worker count must be positive"
         ))
     }
     if negative_timeout(options.accept_timeout_milliseconds) ||

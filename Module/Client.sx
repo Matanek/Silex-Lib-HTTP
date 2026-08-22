@@ -12,6 +12,56 @@ public enum AddressPolicy {
     public_only
 }
 
+public struct Proxy {
+    let url:HTTP.Url
+    let authorization:str?
+
+    static func parse(value:str) Result<Proxy, HTTP.Error> {
+        var parsed = empty_url()
+        match HTTP.Url.parse(value) {
+            success(url) => { parsed = url }
+            failure(error) => { return Result<Proxy, HTTP.Error>.failure(error) }
+        }
+        if parsed.scheme != "http" {
+            return Result<Proxy, HTTP.Error>.failure(HTTP.failure(
+                HTTP.ErrorKind.proxy,
+                value,
+                "HTTP proxy URLs must use the http scheme"
+            ))
+        }
+        if parsed.target != "/" {
+            return Result<Proxy, HTTP.Error>.failure(HTTP.failure(
+                HTTP.ErrorKind.proxy,
+                value,
+                "HTTP proxy URLs cannot contain a path, query, or fragment"
+            ))
+        }
+        return Result<Proxy, HTTP.Error>.success(Proxy(url:parsed, authorization:null))
+    }
+
+    func with_basic_authentication(username:str, password:str) Proxy {
+        return Proxy(
+            url:self.url,
+            authorization:"Basic " + base64(UTF8.bytes(username + ":" + password))
+        )
+    }
+
+    func with_bearer_authentication(token:str) Result<Proxy, HTTP.Error> {
+        if token == "" {
+            return Result<Proxy, HTTP.Error>.failure(HTTP.failure(
+                HTTP.ErrorKind.invalid_configuration, null, "proxy Bearer token must not be empty"
+            ))
+        }
+        let value = "Bearer " + token
+        var headers = HTTP.Headers()
+        match headers.try_set("Proxy-Authorization", value) {
+            success => {}
+            failure(error) => { return Result<Proxy, HTTP.Error>.failure(error) }
+        }
+        return Result<Proxy, HTTP.Error>.success(Proxy(url:self.url, authorization:value))
+    }
+}
+
 public struct Options {
     let limits:HTTP.Limits
     let connect_timeout_milliseconds:int?
@@ -22,6 +72,7 @@ public struct Options {
     let maximum_idle_connections_per_origin:int
     let allow_insecure_redirects:bool
     let address_policy:AddressPolicy
+    let proxy:Proxy?
 
     func with_limits(value:HTTP.Limits) Options {
         return Options(
@@ -33,7 +84,8 @@ public struct Options {
             maximum_redirects:self.maximum_redirects,
             maximum_idle_connections_per_origin:self.maximum_idle_connections_per_origin,
             allow_insecure_redirects:self.allow_insecure_redirects,
-            address_policy:self.address_policy
+            address_policy:self.address_policy,
+            proxy:self.proxy
         )
     }
 
@@ -47,7 +99,8 @@ public struct Options {
             maximum_redirects:self.maximum_redirects,
             maximum_idle_connections_per_origin:self.maximum_idle_connections_per_origin,
             allow_insecure_redirects:self.allow_insecure_redirects,
-            address_policy:self.address_policy
+            address_policy:self.address_policy,
+            proxy:self.proxy
         )
     }
 
@@ -61,7 +114,8 @@ public struct Options {
             maximum_redirects:self.maximum_redirects,
             maximum_idle_connections_per_origin:self.maximum_idle_connections_per_origin,
             allow_insecure_redirects:self.allow_insecure_redirects,
-            address_policy:self.address_policy
+            address_policy:self.address_policy,
+            proxy:self.proxy
         )
     }
 
@@ -75,7 +129,8 @@ public struct Options {
             maximum_redirects:self.maximum_redirects,
             maximum_idle_connections_per_origin:self.maximum_idle_connections_per_origin,
             allow_insecure_redirects:self.allow_insecure_redirects,
-            address_policy:self.address_policy
+            address_policy:self.address_policy,
+            proxy:self.proxy
         )
     }
 
@@ -89,7 +144,8 @@ public struct Options {
             maximum_redirects:self.maximum_redirects,
             maximum_idle_connections_per_origin:self.maximum_idle_connections_per_origin,
             allow_insecure_redirects:self.allow_insecure_redirects,
-            address_policy:self.address_policy
+            address_policy:self.address_policy,
+            proxy:self.proxy
         )
     }
 
@@ -103,7 +159,8 @@ public struct Options {
             maximum_redirects:maximum,
             maximum_idle_connections_per_origin:self.maximum_idle_connections_per_origin,
             allow_insecure_redirects:self.allow_insecure_redirects,
-            address_policy:self.address_policy
+            address_policy:self.address_policy,
+            proxy:self.proxy
         )
     }
 
@@ -117,7 +174,8 @@ public struct Options {
             maximum_redirects:self.maximum_redirects,
             maximum_idle_connections_per_origin:self.maximum_idle_connections_per_origin,
             allow_insecure_redirects:allowed,
-            address_policy:self.address_policy
+            address_policy:self.address_policy,
+            proxy:self.proxy
         )
     }
 
@@ -131,7 +189,8 @@ public struct Options {
             maximum_redirects:self.maximum_redirects,
             maximum_idle_connections_per_origin:self.maximum_idle_connections_per_origin,
             allow_insecure_redirects:self.allow_insecure_redirects,
-            address_policy:policy
+            address_policy:policy,
+            proxy:self.proxy
         )
     }
 
@@ -151,7 +210,23 @@ public struct Options {
             maximum_redirects:self.maximum_redirects,
             maximum_idle_connections_per_origin:maximum,
             allow_insecure_redirects:self.allow_insecure_redirects,
-            address_policy:self.address_policy
+            address_policy:self.address_policy,
+            proxy:self.proxy
+        )
+    }
+
+    func with_proxy(value:Proxy?) Options {
+        return Options(
+            limits:self.limits,
+            connect_timeout_milliseconds:self.connect_timeout_milliseconds,
+            read_timeout_milliseconds:self.read_timeout_milliseconds,
+            write_timeout_milliseconds:self.write_timeout_milliseconds,
+            total_timeout_milliseconds:self.total_timeout_milliseconds,
+            maximum_redirects:self.maximum_redirects,
+            maximum_idle_connections_per_origin:self.maximum_idle_connections_per_origin,
+            allow_insecure_redirects:self.allow_insecure_redirects,
+            address_policy:self.address_policy,
+            proxy:value
         )
     }
 
@@ -165,7 +240,8 @@ public struct Options {
             maximum_redirects:self.maximum_redirects,
             maximum_idle_connections_per_origin:self.maximum_idle_connections_per_origin,
             allow_insecure_redirects:self.allow_insecure_redirects,
-            address_policy:self.address_policy
+            address_policy:self.address_policy,
+            proxy:self.proxy
         )
     }
 }
@@ -180,7 +256,8 @@ public func default_options() Options {
         maximum_redirects:10,
         maximum_idle_connections_per_origin:4,
         allow_insecure_redirects:false,
-        address_policy:AddressPolicy.unrestricted
+        address_policy:AddressPolicy.unrestricted,
+        proxy:null
     )
 }
 
@@ -970,7 +1047,8 @@ public class Session {
         }
         if connection == null { return session_closed_incoming() }
         var active:Connection = connection!
-        match Codec.write_request<Connection>(active, request, deadline) {
+        var outgoing = request_for_transport(url, request, self.shared_options)
+        match Codec.write_request<Connection>(active, outgoing, deadline) {
             success => {}
             failure(error) => {
                 close_connection(active)
@@ -987,7 +1065,7 @@ public class Session {
                 return Result<IncomingResponse, HTTP.Error>.failure(error)
             }
         }
-        let reusable = response_reusable(request, response)
+        let reusable = response_reusable(outgoing, response)
         match IncomingResponse.start(
             response,
             active,
@@ -1023,6 +1101,28 @@ public class Session {
             }
             index--
         }
+        if let proxy = self.shared_options.proxy {
+            match validate_proxy_target(url, self.shared_options, deadline) {
+                success => {}
+                failure(error) => { return Result<Connection, HTTP.Error>.failure(error) }
+            }
+            if url.scheme == "http" {
+                match connect(proxy.url, self.shared_options, deadline) {
+                    success(stream) => {
+                        return Result<Connection, HTTP.Error>.success(Connection.plain(stream))
+                    }
+                    failure(error) => { return Result<Connection, HTTP.Error>.failure(error) }
+                }
+            }
+            if url.scheme == "https" {
+                match connect_proxy_tls(url, proxy, self.shared_options, deadline) {
+                    success(stream) => {
+                        return Result<Connection, HTTP.Error>.success(Connection.secure(stream))
+                    }
+                    failure(error) => { return Result<Connection, HTTP.Error>.failure(error) }
+                }
+            }
+        }
         if url.scheme == "http" {
             match connect(url, self.shared_options, deadline) {
                 success(stream) => {
@@ -1054,7 +1154,7 @@ public class Session {
             }
         }
         headers.set("Host", url.authority())
-        if !headers.contains("User-Agent") { headers.set("User-Agent", "Silex-HTTP/0.4") }
+        if !headers.contains("User-Agent") { headers.set("User-Agent", "Silex-HTTP/0.5") }
         headers.set("Connection", "keep-alive")
         if self.cookie_storage_enabled && !headers.contains("Cookie") {
             let value = self.cookie_header(url)
@@ -1133,9 +1233,10 @@ func session_send_stream<R:IO.Reader>(
     var deadline = HTTP.DeadlineBudget(options.total_timeout_milliseconds)
     session.prepare_request(parsed, request, true)
     var active = try session.acquire(parsed, deadline)
+    var outgoing = request_for_transport(parsed, request, options)
     match Codec.write_request_from<Connection, R>(
         active,
-        request,
+        outgoing,
         input,
         content_length,
         options.limits.maximum_body_bytes,
@@ -1156,7 +1257,7 @@ func session_send_stream<R:IO.Reader>(
         success(value) => { response = value }
     }
     session.capture_cookies(parsed, response.headers())
-    let reusable = response_reusable(request, response)
+    let reusable = response_reusable(outgoing, response)
     var incoming = try IncomingResponse.start(
         response,
         active,
@@ -1591,6 +1692,42 @@ package func same_origin(left:HTTP.Url, right:HTTP.Url) bool {
         left.port == right.port
 }
 
+func request_for_transport(url:HTTP.Url, request:HTTP.Request, options:Options) HTTP.Request {
+    if let proxy = options.proxy {
+        if url.scheme == "http" {
+            var forwarded = HTTP.Request(request.method(), url.text())
+            for header in request.headers().values() {
+                if HTTP.ascii_lower(header.name) != "proxy-authorization" {
+                    forwarded.headers().append(header.name, header.value)
+                }
+            }
+            if let authorization = proxy.authorization {
+                forwarded.headers().set("Proxy-Authorization", authorization)
+            }
+            forwarded.set_body(request.body())
+            return forwarded
+        }
+    }
+    return request
+}
+
+func validate_proxy_target(
+    url:HTTP.Url,
+    options:Options,
+    deadline:HTTP.DeadlineBudget
+) Result<void, HTTP.Error> {
+    if options.address_policy == AddressPolicy.unrestricted {
+        return Result<void, HTTP.Error>.success()
+    }
+    let endpoints = try resolve_endpoints(url, options, deadline)
+    if endpoints.is_empty() {
+        return Result<void, HTTP.Error>.failure(HTTP.failure(
+            HTTP.ErrorKind.network, url.host, "HTTP proxy target resolved to no endpoint"
+        ))
+    }
+    return Result<void, HTTP.Error>.success()
+}
+
 func validate_options(options:Options) Result<void, HTTP.Error> {
     if options.maximum_redirects < 0 {
         return Result<void, HTTP.Error>.failure(HTTP.failure(
@@ -1690,6 +1827,72 @@ func connect_tls(
     return Result<TLS.Stream, HTTP.Error>.failure(HTTP.failure(
         HTTP.ErrorKind.network, url.host, "HTTPS name resolution returned no usable endpoint"
     ))
+}
+
+func connect_proxy_tls(
+    url:HTTP.Url,
+    proxy:Proxy,
+    options:Options,
+    deadline:HTTP.DeadlineBudget
+) Result<TLS.Stream, HTTP.Error> {
+    var transport = try connect(proxy.url, options, deadline)
+    let authority = connect_authority(url)
+    var request = HTTP.Request(HTTP.Method.connect, authority)
+    request.headers().set("Host", authority)
+    request.headers().set("Proxy-Connection", "keep-alive")
+    if let authorization = proxy.authorization {
+        request.headers().set("Proxy-Authorization", authorization)
+    }
+    match Codec.write_request<TCP.Stream>(transport, request, deadline) {
+        success => {}
+        failure(error) => {
+            close_tcp(transport)
+            return Result<TLS.Stream, HTTP.Error>.failure(HTTP.failure(
+                HTTP.ErrorKind.proxy, proxy.url.text(), error.detail
+            ))
+        }
+    }
+    var response = HTTP.Response(500)
+    match Codec.read_final_response_head<TCP.Stream>(transport, options.limits, deadline) {
+        success(value) => { response = value }
+        failure(error) => {
+            close_tcp(transport)
+            return Result<TLS.Stream, HTTP.Error>.failure(HTTP.failure(
+                HTTP.ErrorKind.proxy, proxy.url.text(), error.detail
+            ))
+        }
+    }
+    if response.status() < 200 || response.status() >= 300 {
+        close_tcp(transport)
+        return Result<TLS.Stream, HTTP.Error>.failure(HTTP.failure(
+            HTTP.ErrorKind.proxy,
+            proxy.url.text(),
+            "HTTP proxy rejected CONNECT with status $(response.status())"
+        ))
+    }
+    match TLS.open(transport, url.host) {
+        success(stream) => { return Result<TLS.Stream, HTTP.Error>.success(stream) }
+        failure(error) => {
+            return Result<TLS.Stream, HTTP.Error>.failure(HTTP.failure(
+                HTTP.ErrorKind.secure_transport, error.host, error.detail
+            ))
+        }
+    }
+}
+
+func connect_authority(url:HTTP.Url) str {
+    var host = url.host
+    for byte in UTF8.bytes(host) {
+        if byte == 58 {
+            host = "[" + host + "]"
+            break
+        }
+    }
+    return host + ":" + HTTP.decimal(url.port as int)
+}
+
+func close_tcp(stream:TCP.Stream) {
+    match TCP.close(move stream) { success => {}; failure(error) => {} }
 }
 
 func resolve_endpoints(

@@ -1,0 +1,94 @@
+use HTTP
+use STD.Compression
+use STD.Error as StandardError
+use STD.Text.UTF8
+
+public func decompress(
+    body:@uint8[..],
+    content_encoding:str,
+    maximum_output_bytes:int = 16 * 1024 * 1024
+) Result<uint8[], HTTP.Error> {
+    let encoding = HTTP.ascii_lower(HTTP.trim(content_encoding))
+    if encoding == "" || encoding == "identity" {
+        var copied:uint8[] = []
+        for byte in body { copied.append(byte) }
+        return Result<uint8[], HTTP.Error>.success(copied)
+    }
+    if contains_comma(encoding) {
+        return Result<uint8[], HTTP.Error>.failure(HTTP.failure(
+            HTTP.ErrorKind.unsupported_transfer,
+            content_encoding,
+            "stacked HTTP content encodings are not supported"
+        ))
+    }
+    if encoding == "gzip" || encoding == "x-gzip" {
+        return decompress_format(body, Compression.Format.gzip, maximum_output_bytes, encoding)
+    }
+    if encoding == "deflate" {
+        match Compression.decompress(body, Compression.Format.zlib, maximum_output_bytes) {
+            success(value) => { return Result<uint8[], HTTP.Error>.success(value) }
+            failure(error) => {
+                if error.kind == StandardError.Kind.limit_exceeded {
+                    return Result<uint8[], HTTP.Error>.failure(compression_failure(error, encoding))
+                }
+            }
+        }
+        return decompress_format(body, Compression.Format.raw_deflate, maximum_output_bytes, encoding)
+    }
+    return Result<uint8[], HTTP.Error>.failure(HTTP.failure(
+        HTTP.ErrorKind.unsupported_transfer,
+        content_encoding,
+        "unsupported HTTP Content-Encoding"
+    ))
+}
+
+public func decompress_response(
+    response:HTTP.Response,
+    maximum_output_bytes:int = 16 * 1024 * 1024
+) Result<void, HTTP.Error> {
+    if let encoding = response.headers().get("Content-Encoding") {
+        let encoded = response.body()
+        var decoded:uint8[] = []
+        match decompress(
+            @encoded[0:encoded.count()],
+            encoding,
+            maximum_output_bytes
+        ) {
+            success(value) => { decoded = value }
+            failure(error) => { return Result<void, HTTP.Error>.failure(error) }
+        }
+        response.replace_body(decoded)
+        response.headers().remove("Content-Encoding")
+        response.headers().remove("Content-Length")
+        response.headers().remove("Content-MD5")
+        response.headers().set("Content-Length", HTTP.decimal(decoded.count()))
+    }
+    return Result<void, HTTP.Error>.success()
+}
+
+func decompress_format(
+    body:@uint8[..],
+    format:Compression.Format,
+    maximum_output_bytes:int,
+    encoding:str
+) Result<uint8[], HTTP.Error> {
+    match Compression.decompress(body, format, maximum_output_bytes) {
+        success(value) => { return Result<uint8[], HTTP.Error>.success(value) }
+        failure(error) => {
+            return Result<uint8[], HTTP.Error>.failure(compression_failure(error, encoding))
+        }
+    }
+}
+
+func compression_failure(error:StandardError.Error, encoding:str) HTTP.Error {
+    var kind = HTTP.ErrorKind.malformed_message
+    if error.kind == StandardError.Kind.limit_exceeded { kind = HTTP.ErrorKind.body_limit }
+    return HTTP.failure(kind, encoding, error.detail)
+}
+
+func contains_comma(value:str) bool {
+    for byte in UTF8.bytes(value) {
+        if byte == 44 { return true }
+    }
+    return false
+}

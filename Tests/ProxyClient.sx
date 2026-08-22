@@ -1,0 +1,51 @@
+use HTTP
+use HTTP.Client
+use STD.Process
+use STD.Text.UTF8
+
+func parse_port(text:str) uint16 {
+    var value = 0
+    for byte in UTF8.bytes(text) {
+        if byte < 48 || byte > 57 { panic("proxy test port must be numeric") }
+        value = value * 10 + (byte - 48) as int
+        if value > 65_535 { panic("proxy test port exceeds uint16") }
+    }
+    if value <= 0 { panic("proxy test port must be positive") }
+    return value as uint16
+}
+
+func selected_port() uint16 {
+    match Process.arguments() {
+        success(arguments) => {
+            if arguments.count() > 1 { return parse_port(arguments[1]) }
+        }
+        failure(error) => { panic(error.detail) }
+    }
+    return 18083
+}
+
+func run() Result<void, HTTP.Error> {
+    var proxy = try Client.Proxy.parse("http://127.0.0.1:$(selected_port())")
+    proxy = proxy.with_basic_authentication("proxy-user", "proxy-pass")
+    let options = Client.default_options()
+        .with_proxy(proxy)
+        .with_connect_timeout(2_000)
+        .with_total_timeout(5_000)
+
+    var response = try Client.get("http://example.test:8080/resource?value=1", options)
+    assert(try response.text() == "proxy-ok")
+
+    match Client.get("https://secure.example.test/private", options) {
+        success(unexpected) => { panic("the proxy should reject the CONNECT probe") }
+        failure(error) => { assert(error.kind == HTTP.ErrorKind.proxy) }
+    }
+    print("HTTP proxy absolute targets, authentication and CONNECT verified")
+    return Result<void, HTTP.Error>.success()
+}
+
+func main() {
+    match run() {
+        success => {}
+        failure(error) => { panic(error.detail) }
+    }
+}

@@ -36,6 +36,7 @@ public enum ErrorKind {
     secure_transport
     deadline_exceeded
     network_policy
+    proxy
     malformed_message
     header_limit
     body_limit
@@ -815,7 +816,7 @@ package func header_name_byte(byte:uint8) bool {
         byte == 96 || byte == 124 || byte == 126
 }
 
-func byte_slice(bytes:uint8[], start:int, end:int) str {
+package func byte_slice(bytes:uint8[], start:int, end:int) str {
     if start >= end { return "" }
     var result:uint8[] = []
     var index = start

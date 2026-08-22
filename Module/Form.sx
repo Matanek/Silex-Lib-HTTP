@@ -1,0 +1,24 @@
+use HTTP
+use STD.Text.UTF8
+
+public func parse_urlencoded(value:str) Result<HTTP.QueryParameter[], HTTP.Error> {
+    return HTTP.parse_query("/?" + value)
+}
+
+public func parse_urlencoded(value:@uint8[..]) Result<HTTP.QueryParameter[], HTTP.Error> {
+    if value.is_empty() { return Result<HTTP.QueryParameter[], HTTP.Error>.success([]) }
+    match UTF8.decode(value) {
+        success(text) => { return parse_urlencoded(text) }
+        failure(error) => {
+            return Result<HTTP.QueryParameter[], HTTP.Error>.failure(HTTP.failure(
+                HTTP.ErrorKind.invalid_text,
+                "application/x-www-form-urlencoded",
+                "form body is not valid UTF-8 at byte $(error.byte_offset)"
+            ))
+        }
+    }
+}
+
+public func encode_urlencoded(parameters:HTTP.QueryParameter[]) str {
+    return HTTP.encode_query(parameters)
+}

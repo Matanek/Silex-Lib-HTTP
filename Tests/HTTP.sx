@@ -1,11 +1,16 @@
 use HTTP
 use HTTP.Client
 use HTTP.Codec
+use HTTP.ContentCoding
+use HTTP.Form
+use HTTP.Media
+use HTTP.Multipart
 use HTTP.Server
 use STD.Error
 use STD.IO
 use STD.Network
 use STD.Text.UTF8
+use STD.Threading
 
 class MemoryStream:IO.Reader, IO.Writer {
     private let input:uint8[]
@@ -79,6 +84,14 @@ func require_text(result:Result<str, HTTP.Error>) str {
     return output
 }
 
+func bytes_text(bytes:uint8[]) str {
+    if bytes.is_empty() { return "" }
+    match UTF8.decode(@bytes[0:bytes.count()]) {
+        success(text) => { return text }
+        failure(error) => { panic("test bytes are not UTF-8") }
+    }
+}
+
 func require_session(result:Result<Client.Session, HTTP.Error>) Client.Session {
     var output:Client.Session? = null
     match result {
@@ -87,6 +100,92 @@ func require_session(result:Result<Client.Session, HTTP.Error>) Client.Session {
     }
     if var session = output { return session }
     panic("client session should be available")
+}
+
+func require_listener(result:Result<Server.Listener, HTTP.Error>) Server.Listener {
+    var output:Server.Listener? = null
+    match result {
+        success(value) => { output = value }
+        failure(error) => { panic(error.detail) }
+    }
+    if var listener = output { return listener }
+    panic("server listener should be available")
+}
+
+func require_endpoint(result:Result<Network.Endpoint, HTTP.Error>) Network.Endpoint {
+    var output = Network.Endpoint(
+        address:Network.IpAddress.ipv4([127, 0, 0, 1]),
+        port:0,
+        scope_id:0
+    )
+    match result {
+        success(value) => { output = value }
+        failure(error) => { panic(error.detail) }
+    }
+    return output
+}
+
+func require_multipart(
+    result:Result<Multipart.MultipartReader<MemoryStream>, HTTP.Error>
+) Multipart.MultipartReader<MemoryStream> {
+    var output:Multipart.MultipartReader<MemoryStream>? = null
+    match result {
+        success(value) => { output = value }
+        failure(error) => { panic(error.detail) }
+    }
+    if var reader = output { return reader }
+    panic("multipart reader should be available")
+}
+
+func application_handler(context:@Server.Context) HTTP.Response {
+    var identifier = "missing"
+    if let value = context.parameter("id") { identifier = value }
+    return HTTP.Response.text(200, identifier)
+}
+
+func limited_body_handler(context:@Server.Context) HTTP.Response {
+    var body = context.body()
+    match body.read() {
+        success(bytes) => { return HTTP.Response.text(200, "accepted") }
+        failure(error) => {
+            if error.kind == HTTP.ErrorKind.body_limit {
+                return Server.standardized_error(Server.application_error(
+                    413, "route_body_limit", error.detail
+                ))
+            }
+            return Server.standardized_error(Server.application_error(
+                500, "body_read", error.detail
+            ))
+        }
+    }
+}
+
+func allow_request(context:@Server.Context) Result<void, Server.ApplicationError> {
+    return Result<void, Server.ApplicationError>.success()
+}
+
+func annotate_response(
+    context:@Server.Context,
+    response:@HTTP.Response
+) Result<void, Server.ApplicationError> {
+    response.headers().set("X-Middleware", "after")
+    return Result<void, Server.ApplicationError>.success()
+}
+
+struct RouterServer:Threading.Job {
+    var listener:Server.Listener
+    var router:Server.Router
+
+    func execute() {
+        {
+            var router = self.router
+            let handler:func(@HTTP.Request, Server.IncomingBody) HTTP.Response = router.handle
+            match self.listener.serve_stream_once(handler) {
+                success => {}
+                failure(error) => { panic(error.detail) }
+            }
+        }
+    }
 }
 
 test "parse URL authority target and fragment" {
@@ -99,6 +198,192 @@ test "parse URL authority target and fragment" {
             assert(url.target == "/docs?q=silex")
             assert(url.authority() == "127.0.0.1:8080")
         }
+    }
+}
+
+test "parse HTTP media metadata and form bodies" {
+    match Media.MediaType.parse("Text/HTML; Charset=\"utf-8\"; boundary=silex") {
+        failure(error) => { panic(error.detail) }
+        success(media) => {
+            assert(media.matches("text", "html"))
+            if let charset = media.charset() { assert(charset == "utf-8") }
+            else { panic("charset should be present") }
+            assert(media.text() == "text/html; charset=utf-8; boundary=silex")
+        }
+    }
+    match Media.ContentDisposition.parse("attachment; filename=\"report final.txt\"") {
+        failure(error) => { panic(error.detail) }
+        success(disposition) => {
+            if let filename = disposition.filename() { assert(filename == "report final.txt") }
+            else { panic("filename should be present") }
+        }
+    }
+    let fields = require_parameters(Form.parse_urlencoded("name=Silex+HTTP&tag=a%2Fb"))
+    assert(fields.count() == 2)
+    assert(fields[0].name == "name" && fields[0].value == "Silex HTTP")
+    assert(Form.encode_urlencoded(fields) == "name=Silex%20HTTP&tag=a%2Fb")
+}
+
+test "decompress HTTP gzip and deflate content codings" {
+    let gzip:uint8[] = [
+        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03,
+        0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00,
+        0x86, 0xa6, 0x10, 0x36, 0x05, 0x00, 0x00, 0x00
+    ]
+    let zlib:uint8[] = [
+        0x78, 0x9c, 0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00,
+        0x06, 0x2c, 0x02, 0x15
+    ]
+    match ContentCoding.decompress(@gzip[0:gzip.count()], "gzip") {
+        success(value) => { assert(bytes_text(value) == "hello") }
+        failure(error) => { panic(error.detail) }
+    }
+    match ContentCoding.decompress(@zlib[0:zlib.count()], "deflate") {
+        success(value) => { assert(bytes_text(value) == "hello") }
+        failure(error) => { panic(error.detail) }
+    }
+}
+
+test "stream multipart form-data parts" {
+    var input = MemoryStream(
+        "--silex-boundary\r\n" +
+        "Content-Disposition: form-data; name=\"title\"\r\n\r\n" +
+        "hello\r\n" +
+        "--silex-boundary\r\n" +
+        "Content-Disposition: form-data; name=\"upload\"; filename=\"a.txt\"\r\n" +
+        "Content-Type: text/plain; charset=utf-8\r\n\r\n" +
+        "file body\r\n" +
+        "--silex-boundary--\r\n"
+    )
+    var content_type = Media.MediaType(
+        type_name:"multipart", subtype:"form-data", parameters:[]
+    )
+    match Media.MediaType.parse("multipart/form-data; boundary=silex-boundary") {
+        failure(error) => { panic(error.detail) }
+        success(value) => { content_type = value }
+    }
+    var parts = require_multipart(Multipart.multipart(input, content_type))
+    match parts.next() {
+        failure(error) => { panic(error.detail) }
+        success(part) => {
+            if let metadata = part {
+                if let name = metadata.name { assert(name == "title") }
+                else { panic("part name should be present") }
+            } else { panic("first part should be present") }
+        }
+    }
+    match parts.read_part() {
+        failure(error) => { panic(error.detail) }
+        success(bytes) => { assert(bytes_text(bytes) == "hello") }
+    }
+    match parts.next() {
+        failure(error) => { panic(error.detail) }
+        success(part) => {
+            if let metadata = part {
+                if let filename = metadata.filename { assert(filename == "a.txt") }
+                else { panic("part filename should be present") }
+            } else { panic("second part should be present") }
+        }
+    }
+    match parts.read_part() {
+        failure(error) => { panic(error.detail) }
+        success(bytes) => { assert(bytes_text(bytes) == "file body") }
+    }
+    assert(parts.finished())
+}
+
+test "configure application routes and middleware" {
+    var router = Server.Router()
+    match router.get("/users/:id", application_handler) {
+        success => {}
+        failure(error) => { panic(error.detail) }
+    }
+    router.add_middleware(Server.Middleware(allow_request, annotate_response))
+    match router.post("/uploads/*path", application_handler) {
+        success => {}
+        failure(error) => { panic(error.detail) }
+    }
+    match router.limit(
+        HTTP.Method.post,
+        "/uploads/*path",
+        Server.RouteLimits(maximum_body_bytes:1_024, maximum_headers:16)
+    ) {
+        success => {}
+        failure(error) => { panic(error.detail) }
+    }
+    var application = Server.Application(router)
+    assert(!application.running())
+    application.stop()
+}
+
+test "serve routed parameters and middleware over a real connection" {
+    var router = Server.Router()
+    match router.get("/users/:id", application_handler) {
+        success => {}
+        failure(error) => { panic(error.detail) }
+    }
+    router.add_middleware(Server.Middleware(allow_request, annotate_response))
+    var listener = require_listener(Server.listen("127.0.0.1", 0))
+    let endpoint = require_endpoint(listener.local_endpoint())
+    var executor = Threading.Executor(worker_count:1)
+    var serving = executor.submit(RouterServer(listener:listener, router:router))
+    var response = require_response(Client.get(
+        "http://127.0.0.1:$(endpoint.port)/users/42",
+        Client.default_options().with_connect_timeout(1_000)
+    ))
+    assert(response.status() == 200)
+    assert(require_text(response.text()) == "42")
+    if let value = response.headers().get("X-Middleware") { assert(value == "after") }
+    else { panic("after middleware header should be present") }
+    var completed = serving.complete()
+}
+
+test "enforce route body limits on progressive reads" {
+    var router = Server.Router()
+    match router.post("/limited", limited_body_handler) {
+        success => {}
+        failure(error) => { panic(error.detail) }
+    }
+    match router.limit(
+        HTTP.Method.post,
+        "/limited",
+        Server.RouteLimits(maximum_body_bytes:4, maximum_headers:null)
+    ) {
+        success => {}
+        failure(error) => { panic(error.detail) }
+    }
+    var listener = require_listener(Server.listen("127.0.0.1", 0))
+    let endpoint = require_endpoint(listener.local_endpoint())
+    var executor = Threading.Executor(worker_count:1)
+    var serving = executor.submit(RouterServer(listener:listener, router:router))
+    var response = require_response(Client.post(
+        "http://127.0.0.1:$(endpoint.port)/limited",
+        "too large",
+        Client.default_options().with_connect_timeout(1_000)
+    ))
+    assert(response.status() == 413)
+    if let code = response.headers().get("X-Error-Code") {
+        assert(code == "body_limit")
+    } else { panic("route limit response should identify its error code") }
+    var completed = serving.complete()
+}
+
+test "configure HTTP proxies explicitly" {
+    var proxy = Client.Proxy(url:require_url(HTTP.Url.parse("http://127.0.0.1:8080")), authorization:null)
+    match Client.Proxy.parse("http://127.0.0.1:8080") {
+        success(value) => { proxy = value.with_basic_authentication("user", "pass") }
+        failure(error) => { panic(error.detail) }
+    }
+    let options = Client.default_options().with_proxy(proxy)
+    if let configured = options.proxy {
+        assert(configured.url.port == 8080)
+        if let authorization = configured.authorization {
+            assert(authorization == "Basic dXNlcjpwYXNz")
+        } else { panic("proxy authorization should be configured") }
+    } else { panic("proxy should be configured") }
+    match Client.Proxy.parse("https://proxy.example") {
+        success(value) => { panic("HTTPS proxy transports are not supported") }
+        failure(error) => { assert(error.kind == HTTP.ErrorKind.proxy) }
     }
 }
 

@@ -1,0 +1,267 @@
+use HTTP.Error
+use HTTP.Error as HTTPError
+use HTTP.ErrorKind
+use HTTP.ascii_lower
+use HTTP.byte_slice
+use HTTP.failure as http_error
+use HTTP.text_from_byte
+use HTTP.text_from_bytes
+use HTTP.trim
+use STD.Text.UTF8
+
+public struct MediaParameter {
+    let name:str
+    let value:str
+}
+
+public struct MediaType {
+    let type_name:str
+    let subtype:str
+    let parameters:MediaParameter[]
+
+    static func parse(value:str) Result<MediaType, HTTPError> {
+        return parse_media_type(value)
+    }
+
+    func parameter(name:str) str? {
+        let expected = ascii_lower(name)
+        for parameter in self.parameters {
+            if ascii_lower(parameter.name) == expected { return parameter.value }
+        }
+        return null
+    }
+
+    func charset() str? { return self.parameter("charset") }
+
+    func matches(type_name:str, subtype:str) bool {
+        return self.type_name == ascii_lower(type_name) && self.subtype == ascii_lower(subtype)
+    }
+
+    func text() str {
+        var result = self.type_name + "/" + self.subtype
+        for parameter in self.parameters {
+            result += "; " + parameter.name + "=" + quote_parameter(parameter.value)
+        }
+        return result
+    }
+}
+
+public struct ContentDisposition {
+    let kind:str
+    let parameters:MediaParameter[]
+
+    static func parse(value:str) Result<ContentDisposition, HTTPError> {
+        var pieces = ParameterizedValue(primary:"", parameters:[])
+        match parse_parameterized(value, "Content-Disposition") {
+            success(parsed) => { pieces = parsed }
+            failure(error) => {
+                return Result<ContentDisposition, Error>.failure(error)
+            }
+        }
+        if !valid_token(pieces.primary) {
+            return Result<ContentDisposition, Error>.failure(http_error(
+                ErrorKind.malformed_message, value, "Content-Disposition type is not a valid token"
+            ))
+        }
+        return Result<ContentDisposition, Error>.success(ContentDisposition(
+            kind:ascii_lower(pieces.primary), parameters:pieces.parameters
+        ))
+    }
+
+    static func attachment(filename:str) Result<ContentDisposition, HTTPError> {
+        if contains_control(filename) {
+            return Result<ContentDisposition, Error>.failure(http_error(
+                ErrorKind.invalid_header, filename, "download filename contains a control byte"
+            ))
+        }
+        return Result<ContentDisposition, Error>.success(ContentDisposition(
+            kind:"attachment",
+            parameters:[MediaParameter(name:"filename", value:filename)]
+        ))
+    }
+
+    func parameter(name:str) str? {
+        let expected = ascii_lower(name)
+        for parameter in self.parameters {
+            if ascii_lower(parameter.name) == expected { return parameter.value }
+        }
+        return null
+    }
+
+    func name() str? { return self.parameter("name") }
+    func filename() str? { return self.parameter("filename") }
+
+    func text() str {
+        var result = self.kind
+        for parameter in self.parameters {
+            result += "; " + parameter.name + "=" + quote_parameter(parameter.value)
+        }
+        return result
+    }
+}
+
+struct ParameterizedValue {
+    let primary:str
+    let parameters:MediaParameter[]
+}
+
+func parse_media_type(value:str) Result<MediaType, HTTPError> {
+    let pieces = try parse_parameterized(value, "Content-Type")
+    let primary = UTF8.bytes(pieces.primary)
+    var slash = -1
+    var index = 0
+    while index < primary.count() {
+        if primary[index] == 47 {
+            if slash >= 0 {
+                return Result<MediaType, Error>.failure(http_error(
+                    ErrorKind.malformed_message, value, "Content-Type contains more than one slash"
+                ))
+            }
+            slash = index
+        }
+        index++
+    }
+    if slash <= 0 || slash == primary.count() - 1 {
+        return Result<MediaType, Error>.failure(http_error(
+            ErrorKind.malformed_message, value, "Content-Type requires a type and subtype"
+        ))
+    }
+    let type_name = byte_slice(primary, 0, slash)
+    let subtype = byte_slice(primary, slash + 1, primary.count())
+    if !valid_token(type_name) || !valid_token(subtype) {
+        return Result<MediaType, Error>.failure(http_error(
+            ErrorKind.malformed_message, value, "Content-Type type or subtype is not a valid token"
+        ))
+    }
+    return Result<MediaType, Error>.success(MediaType(
+        type_name:ascii_lower(type_name),
+        subtype:ascii_lower(subtype),
+        parameters:pieces.parameters
+    ))
+}
+
+func parse_parameterized(value:str, subject:str) Result<ParameterizedValue, HTTPError> {
+    let bytes = UTF8.bytes(value)
+    var pieces:str[] = []
+    var start = 0
+    var index = 0
+    var quoted = false
+    var escaped = false
+    while index <= bytes.count() {
+        if index == bytes.count() || (bytes[index] == 59 && !quoted) {
+            pieces.append(trim(byte_slice(bytes, start, index)))
+            start = index + 1
+        } elif escaped { escaped = false }
+        elif quoted && bytes[index] == 92 { escaped = true }
+        elif bytes[index] == 34 { quoted = !quoted }
+        index++
+    }
+    if quoted || escaped || pieces.is_empty() || pieces[0] == "" {
+        return Result<ParameterizedValue, Error>.failure(http_error(
+            ErrorKind.malformed_message, value, subject + " has an unterminated or empty value"
+        ))
+    }
+    var parameters:MediaParameter[] = []
+    index = 1
+    while index < pieces.count() {
+        let piece = UTF8.bytes(pieces[index])
+        var equals = -1
+        var cursor = 0
+        while cursor < piece.count() {
+            if piece[cursor] == 61 { equals = cursor; break }
+            cursor++
+        }
+        if equals <= 0 {
+            return Result<ParameterizedValue, Error>.failure(http_error(
+                ErrorKind.malformed_message, value, subject + " parameter requires name=value"
+            ))
+        }
+        let name = ascii_lower(trim(byte_slice(piece, 0, equals)))
+        let raw = trim(byte_slice(piece, equals + 1, piece.count()))
+        if !valid_token(name) || raw == "" {
+            return Result<ParameterizedValue, Error>.failure(http_error(
+                ErrorKind.malformed_message, value, subject + " contains an invalid parameter"
+            ))
+        }
+        let decoded = try decode_parameter(raw, value)
+        for existing in parameters {
+            if existing.name == name {
+                return Result<ParameterizedValue, Error>.failure(http_error(
+                    ErrorKind.malformed_message, value, subject + " repeats parameter " + name
+                ))
+            }
+        }
+        parameters.append(MediaParameter(name:name, value:decoded))
+        index++
+    }
+    return Result<ParameterizedValue, Error>.success(ParameterizedValue(
+        primary:ascii_lower(pieces[0]), parameters:parameters
+    ))
+}
+
+func decode_parameter(value:str, subject:str) Result<str, HTTPError> {
+    let bytes = UTF8.bytes(value)
+    if bytes[0] != 34 {
+        if !valid_token(value) {
+            return Result<str, Error>.failure(http_error(
+                ErrorKind.malformed_message, subject, "parameter value is not a token or quoted string"
+            ))
+        }
+        return Result<str, Error>.success(value)
+    }
+    if bytes.count() < 2 || bytes[bytes.count() - 1] != 34 {
+        return Result<str, Error>.failure(http_error(
+            ErrorKind.malformed_message, subject, "quoted parameter is not terminated"
+        ))
+    }
+    var decoded:uint8[] = []
+    var index = 1
+    while index < bytes.count() - 1 {
+        if bytes[index] == 92 {
+            index++
+            if index >= bytes.count() - 1 {
+                return Result<str, Error>.failure(http_error(
+                    ErrorKind.malformed_message, subject, "quoted parameter escape is incomplete"
+                ))
+            }
+        }
+        if bytes[index] < 32 || bytes[index] == 127 {
+            return Result<str, Error>.failure(http_error(
+                ErrorKind.malformed_message, subject, "quoted parameter contains a control byte"
+            ))
+        }
+        decoded.append(bytes[index])
+        index++
+    }
+    return Result<str, Error>.success(text_from_bytes(decoded))
+}
+
+func quote_parameter(value:str) str {
+    if valid_token(value) { return value }
+    var result = "\""
+    for byte in UTF8.bytes(value) {
+        if byte == 34 || byte == 92 { result += "\\" }
+        result += text_from_byte(byte)
+    }
+    return result + "\""
+}
+
+func valid_token(value:str) bool {
+    let bytes = UTF8.bytes(value)
+    if bytes.is_empty() { return false }
+    for byte in bytes {
+        let alpha_numeric = (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) ||
+            (byte >= 97 && byte <= 122)
+        if !alpha_numeric && byte != 33 && byte != 35 && byte != 36 && byte != 37 && byte != 38 &&
+            byte != 39 && byte != 42 && byte != 43 && byte != 45 && byte != 46 && byte != 94 &&
+            byte != 95 && byte != 96 && byte != 124 && byte != 126 { return false }
+    }
+    return true
+}
+
+package func contains_control(value:str) bool {
+    for byte in UTF8.bytes(value) {
+        if byte < 32 || byte == 127 { return true }
+    }
+    return false
+}
