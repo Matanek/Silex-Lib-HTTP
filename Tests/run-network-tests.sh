@@ -13,8 +13,8 @@ port=$((20000 + RANDOM % 20000))
 proxy_port=$((40001 + RANDOM % 20000))
 
 cd "$workspace"
-silex compile Packages/HTTP/Examples/StreamingServer.sx -o "$server_binary"
-silex compile Packages/HTTP/Examples/StreamingClient.sx -o "$client_binary"
+silex compile Packages/HTTP/Tests/StreamingServer.sx -o "$server_binary"
+silex compile Packages/HTTP/Tests/StreamingClient.sx -o "$client_binary"
 silex compile Packages/HTTP/Tests/NetworkClient.sx -o "$probe_binary"
 silex compile Packages/HTTP/Tests/ProxyClient.sx -o "$proxy_binary"
 

@@ -223,10 +223,9 @@ The incoming body and response writer exist only for the duration of the
 handler. A writer accepts exactly one response. Fixed and chunked output both
 obey the configured body limit and connection deadline.
 
-See `Examples/AdvancedServer.sx`, `Examples/AdvancedClient.sx`,
-`Examples/SessionClient.sx`, `Examples/StreamingServer.sx` and
-`Examples/StreamingClient.sx` for complete buffered, reusable and progressive
-flows.
+The buffered, reusable and progressive flows are documented in the client,
+server and streaming sections above. The complete streaming client/server pair
+used for integration validation lives under `Tests/`.
 
 ## Protocol guarantees and limits
 
@@ -259,12 +258,5 @@ From the Silex project workspace root:
 ```text
 silex link Packages/HTTP
 silex test Packages/HTTP/Tests
-silex run Packages/HTTP/Examples/Server.sx
-silex run Packages/HTTP/Examples/Client.sx
-silex run Packages/HTTP/Examples/AdvancedServer.sx
-silex run Packages/HTTP/Examples/AdvancedClient.sx
-silex run Packages/HTTP/Examples/SessionClient.sx
-silex run Packages/HTTP/Examples/StreamingServer.sx
-silex run Packages/HTTP/Examples/StreamingClient.sx
 Packages/HTTP/Tests/run-network-tests.sh
 ```
