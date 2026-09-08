@@ -1,8 +1,7 @@
 # HTTP
 
-`HTTP` fournit un modèle HTTP/1.1 borné, un client réutilisable et un serveur
-d’applications pour Silex. Les formats de corps restent indépendants du
-transport.
+`HTTP` provides a bounded HTTP/1.1 model, a reusable client, and an application
+server for Silex. Body formats remain independent from the transport.
 
 ```text
 silex install HTTP
@@ -10,7 +9,7 @@ silex install HTTP
 
 ## Documentation
 
-- [Documentation française](Docs/FR/README.md)
+- [French documentation](Docs/FR/README.md)
 - [English documentation](Docs/EN/README.md)
 
-Le package nécessite Silex 0.43.0 ou une version ultérieure.
+The package requires Silex 0.43.0 or newer.
