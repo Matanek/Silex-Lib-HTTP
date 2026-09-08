@@ -1,6 +1,6 @@
 {
   "name": "HTTP",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "description": {
     "en": "Bounded HTTP/1.1 types, reusable clients, and application servers.",
     "fr": "Types HTTP/1.1 bornés, clients réutilisables et serveurs d’applications."
