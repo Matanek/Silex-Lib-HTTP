@@ -18,7 +18,7 @@ func require_session(result:Result<Client.Session, HTTP.Error>) Client.Session {
 test "compose public web package APIs" {
     var response = HTTP.Response.text(200, "{\"status\":\"ok\"}", "application/json")
     var response_text = ""
-    match response.text() {
+    match (try response.text()) {
         success(text) => { response_text = text }
         failure(error) => { panic(error.detail) }
     }
@@ -35,7 +35,7 @@ test "compose public web package APIs" {
     var feed = XML.parse("<feed><entry>Silex</entry></feed>")
     assert(feed.elements("entry")[0].text_content() == "Silex")
 
-    match HTTP.Url.parse("https://example.com/docs?q=1") {
+    match (try HTTP.Url.parse("https://example.com/docs?q=1")) {
         success(url) => {
             assert(url.port == 443)
             assert(url.target == "/docs?q=1")
@@ -52,18 +52,18 @@ test "compose public web package APIs" {
         .with_public_network_only()
     assert(bounded.address_policy == Client.AddressPolicy.public_only)
     var headers = HTTP.Headers()
-    match headers.try_set("Accept", "application/json") {
+    match (try headers.set("Accept", "application/json")) {
         success => { assert(headers.contains("Accept")) }
         failure(error) => { panic(error.detail) }
     }
-    var session = require_session(Client.Session.create(bounded))
-    match session.authenticate_basic("silex", "secret") {
+    var session = require_session((try Client.Session.create(bounded)))
+    match (try session.authenticate_basic("silex", "secret")) {
         success => {}
         failure(error) => { panic(error.detail) }
     }
     session.enable_cookies()
     assert(session.cookies_enabled())
-    match session.close() {
+    match (try session.close()) {
         success => {}
         failure(error) => { panic(error.detail) }
     }

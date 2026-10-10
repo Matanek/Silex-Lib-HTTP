@@ -41,7 +41,7 @@ class MemoryStream:IO.Reader, IO.Writer {
 
     func written_text() str {
         if self.output.count() == 0 { return "" }
-        match UTF8.decode(@self.output[0:self.output.count()]) {
+        match (try UTF8.decode(@self.output[0:self.output.count()])) {
             success(text) => { return text }
             failure(error) => { panic("test output is not UTF-8") }
         }
@@ -86,7 +86,7 @@ func require_text(result:Result<str, HTTP.Error>) str {
 
 func bytes_text(bytes:uint8[]) str {
     if bytes.is_empty() { return "" }
-    match UTF8.decode(@bytes[0:bytes.count()]) {
+    match (try UTF8.decode(@bytes[0:bytes.count()])) {
         success(text) => { return text }
         failure(error) => { panic("test bytes are not UTF-8") }
     }
@@ -145,7 +145,7 @@ func application_handler(context:@Server.Context) HTTP.Response {
 
 func limited_body_handler(context:@Server.Context) HTTP.Response {
     var body = context.body()
-    match body.read() {
+    match (try body.read()) {
         success(bytes) => { return HTTP.Response.text(200, "accepted") }
         failure(error) => {
             if error.kind == HTTP.ErrorKind.body_limit {
@@ -180,7 +180,7 @@ struct RouterServer:Threading.Job {
         {
             var router = self.router
             let handler:func(@HTTP.Request, Server.IncomingBody) HTTP.Response = router.handle
-            match self.listener.serve_stream_once(handler) {
+            match (try self.listener.serve_stream_once(handler)) {
                 success => {}
                 failure(error) => { panic(error.detail) }
             }
@@ -189,7 +189,7 @@ struct RouterServer:Threading.Job {
 }
 
 test "parse URL authority target and fragment" {
-    match HTTP.Url.parse("http://127.0.0.1:8080/docs?q=silex#section") {
+    match (try HTTP.Url.parse("http://127.0.0.1:8080/docs?q=silex#section")) {
         failure(error) => { panic(error.detail) }
         success(url) => {
             assert(url.scheme == "http")
@@ -202,7 +202,7 @@ test "parse URL authority target and fragment" {
 }
 
 test "parse HTTP media metadata and form bodies" {
-    match Media.MediaType.parse("Text/HTML; Charset=\"utf-8\"; boundary=silex") {
+    match (try Media.MediaType.parse("Text/HTML; Charset=\"utf-8\"; boundary=silex")) {
         failure(error) => { panic(error.detail) }
         success(media) => {
             assert(media.matches("text", "html"))
@@ -211,14 +211,14 @@ test "parse HTTP media metadata and form bodies" {
             assert(media.text() == "text/html; charset=utf-8; boundary=silex")
         }
     }
-    match Media.ContentDisposition.parse("attachment; filename=\"report final.txt\"") {
+    match (try Media.ContentDisposition.parse("attachment; filename=\"report final.txt\"")) {
         failure(error) => { panic(error.detail) }
         success(disposition) => {
             if let filename = disposition.filename() { assert(filename == "report final.txt") }
             else { panic("filename should be present") }
         }
     }
-    let fields = require_parameters(Form.parse_urlencoded("name=Silex+HTTP&tag=a%2Fb"))
+    let fields = require_parameters((try Form.parse_urlencoded("name=Silex+HTTP&tag=a%2Fb")))
     assert(fields.count() == 2)
     assert(fields[0].name == "name" && fields[0].value == "Silex HTTP")
     assert(Form.encode_urlencoded(fields) == "name=Silex%20HTTP&tag=a%2Fb")
@@ -234,11 +234,11 @@ test "decompress HTTP gzip and deflate content codings" {
         0x78, 0x9c, 0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00,
         0x06, 0x2c, 0x02, 0x15
     ]
-    match ContentCoding.decompress(@gzip[0:gzip.count()], "gzip") {
+    match (try ContentCoding.decompress(@gzip[0:gzip.count()], "gzip")) {
         success(value) => { assert(bytes_text(value) == "hello") }
         failure(error) => { panic(error.detail) }
     }
-    match ContentCoding.decompress(@zlib[0:zlib.count()], "deflate") {
+    match (try ContentCoding.decompress(@zlib[0:zlib.count()], "deflate")) {
         success(value) => { assert(bytes_text(value) == "hello") }
         failure(error) => { panic(error.detail) }
     }
@@ -258,12 +258,12 @@ test "stream multipart form-data parts" {
     var content_type = Media.MediaType(
         type_name:"multipart", subtype:"form-data", parameters:[]
     )
-    match Media.MediaType.parse("multipart/form-data; boundary=silex-boundary") {
+    match (try Media.MediaType.parse("multipart/form-data; boundary=silex-boundary")) {
         failure(error) => { panic(error.detail) }
         success(value) => { content_type = value }
     }
-    var parts = require_multipart(Multipart.multipart(input, content_type))
-    match parts.next() {
+    var parts = require_multipart((try Multipart.multipart(input, content_type)))
+    match (try parts.next()) {
         failure(error) => { panic(error.detail) }
         success(part) => {
             if let metadata = part {
@@ -272,11 +272,11 @@ test "stream multipart form-data parts" {
             } else { panic("first part should be present") }
         }
     }
-    match parts.read_part() {
+    match (try parts.read_part()) {
         failure(error) => { panic(error.detail) }
         success(bytes) => { assert(bytes_text(bytes) == "hello") }
     }
-    match parts.next() {
+    match (try parts.next()) {
         failure(error) => { panic(error.detail) }
         success(part) => {
             if let metadata = part {
@@ -285,7 +285,7 @@ test "stream multipart form-data parts" {
             } else { panic("second part should be present") }
         }
     }
-    match parts.read_part() {
+    match (try parts.read_part()) {
         failure(error) => { panic(error.detail) }
         success(bytes) => { assert(bytes_text(bytes) == "file body") }
     }
@@ -294,20 +294,20 @@ test "stream multipart form-data parts" {
 
 test "configure application routes and middleware" {
     var router = Server.Router()
-    match router.get("/users/:id", application_handler) {
+    match (try router.get("/users/:id", application_handler)) {
         success => {}
         failure(error) => { panic(error.detail) }
     }
     router.add_middleware(Server.Middleware(allow_request, annotate_response))
-    match router.post("/uploads/*path", application_handler) {
+    match (try router.post("/uploads/*path", application_handler)) {
         success => {}
         failure(error) => { panic(error.detail) }
     }
-    match router.limit(
+    match (try router.limit(
         HTTP.Method.post,
         "/uploads/*path",
         Server.RouteLimits(maximum_body_bytes:1_024, maximum_headers:16)
-    ) {
+    )) {
         success => {}
         failure(error) => { panic(error.detail) }
     }
@@ -318,21 +318,21 @@ test "configure application routes and middleware" {
 
 test "serve routed parameters and middleware over a real connection" {
     var router = Server.Router()
-    match router.get("/users/:id", application_handler) {
+    match (try router.get("/users/:id", application_handler)) {
         success => {}
         failure(error) => { panic(error.detail) }
     }
     router.add_middleware(Server.Middleware(allow_request, annotate_response))
-    var listener = require_listener(Server.listen("127.0.0.1", 0))
-    let endpoint = require_endpoint(listener.local_endpoint())
+    var listener = require_listener((try Server.listen("127.0.0.1", 0)))
+    let endpoint = require_endpoint((try listener.local_endpoint()))
     var executor = Threading.Executor(worker_count:1)
     var serving = executor.submit(RouterServer(listener:listener, router:router))
-    var response = require_response(Client.get(
+    var response = require_response((try Client.get(
         "http://127.0.0.1:$(endpoint.port)/users/42",
         Client.default_options().with_connect_timeout(1_000)
-    ))
+    )))
     assert(response.status() == 200)
-    assert(require_text(response.text()) == "42")
+    assert(require_text((try response.text())) == "42")
     if let value = response.headers().get("X-Middleware") { assert(value == "after") }
     else { panic("after middleware header should be present") }
     var completed = serving.complete()
@@ -340,27 +340,27 @@ test "serve routed parameters and middleware over a real connection" {
 
 test "enforce route body limits on progressive reads" {
     var router = Server.Router()
-    match router.post("/limited", limited_body_handler) {
+    match (try router.post("/limited", limited_body_handler)) {
         success => {}
         failure(error) => { panic(error.detail) }
     }
-    match router.limit(
+    match (try router.limit(
         HTTP.Method.post,
         "/limited",
         Server.RouteLimits(maximum_body_bytes:4, maximum_headers:null)
-    ) {
+    )) {
         success => {}
         failure(error) => { panic(error.detail) }
     }
-    var listener = require_listener(Server.listen("127.0.0.1", 0))
-    let endpoint = require_endpoint(listener.local_endpoint())
+    var listener = require_listener((try Server.listen("127.0.0.1", 0)))
+    let endpoint = require_endpoint((try listener.local_endpoint()))
     var executor = Threading.Executor(worker_count:1)
     var serving = executor.submit(RouterServer(listener:listener, router:router))
-    var response = require_response(Client.post(
+    var response = require_response((try Client.post(
         "http://127.0.0.1:$(endpoint.port)/limited",
         "too large",
         Client.default_options().with_connect_timeout(1_000)
-    ))
+    )))
     assert(response.status() == 413)
     if let code = response.headers().get("X-Error-Code") {
         assert(code == "body_limit")
@@ -369,8 +369,8 @@ test "enforce route body limits on progressive reads" {
 }
 
 test "configure HTTP proxies explicitly" {
-    var proxy = Client.Proxy(url:require_url(HTTP.Url.parse("http://127.0.0.1:8080")), authorization:null)
-    match Client.Proxy.parse("http://127.0.0.1:8080") {
+    var proxy = Client.Proxy(url:require_url((try HTTP.Url.parse("http://127.0.0.1:8080"))), authorization:null)
+    match (try Client.Proxy.parse("http://127.0.0.1:8080")) {
         success(value) => { proxy = value.with_basic_authentication("user", "pass") }
         failure(error) => { panic(error.detail) }
     }
@@ -381,14 +381,14 @@ test "configure HTTP proxies explicitly" {
             assert(authorization == "Basic dXNlcjpwYXNz")
         } else { panic("proxy authorization should be configured") }
     } else { panic("proxy should be configured") }
-    match Client.Proxy.parse("https://proxy.example") {
+    match (try Client.Proxy.parse("https://proxy.example")) {
         success(value) => { panic("HTTPS proxy transports are not supported") }
         failure(error) => { assert(error.kind == HTTP.ErrorKind.proxy) }
     }
 }
 
 test "preserve IPv6 brackets in HTTP authority" {
-    match HTTP.Url.parse("http://[::1]:8080/") {
+    match (try HTTP.Url.parse("http://[::1]:8080/")) {
         failure(error) => { panic(error.detail) }
         success(url) => {
             assert(url.host == "::1")
@@ -405,13 +405,13 @@ test "decode bounded request body" {
         "payload"
     )
     var request = HTTP.Request.get("/")
-    match Codec.read_request(stream, HTTP.default_limits()) {
+    match (try Codec.read_request(stream, HTTP.default_limits())) {
         failure(error) => { panic(error.detail) }
         success(value) => { request = value }
     }
     assert(request.method() == HTTP.Method.post)
     assert(request.target() == "/items")
-    match request.text() {
+    match (try request.text()) {
         failure(error) => { panic(error.detail) }
         success(text) => { assert(text == "payload") }
     }
@@ -423,12 +423,12 @@ test "decode chunked response" {
         "5\r\nHello\r\n6\r\n Silex\r\n0\r\n\r\n"
     )
     var response = HTTP.Response(500)
-    match Codec.read_response(stream, HTTP.default_limits(), true) {
+    match (try Codec.read_response(stream, HTTP.default_limits(), true)) {
         failure(error) => { panic(error.detail) }
         success(value) => { response = value }
     }
     assert(response.status() == 200)
-    match response.text() {
+    match (try response.text()) {
         failure(error) => { panic(error.detail) }
         success(text) => { assert(text == "Hello Silex") }
     }
@@ -437,7 +437,7 @@ test "decode chunked response" {
 test "encode response with canonical framing" {
     var stream = MemoryStream("")
     var response = HTTP.Response.text(200, "hello")
-    match Codec.write_response(stream, response, true) {
+    match (try Codec.write_response(stream, response, true)) {
         failure(error) => { panic(error.detail) }
         success => {}
     }
@@ -454,7 +454,7 @@ test "reject conflicting response framing" {
     var stream = MemoryStream(
         "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 1\r\n\r\n"
     )
-    match Codec.read_response(stream, HTTP.default_limits(), true) {
+    match (try Codec.read_response(stream, HTTP.default_limits(), true)) {
         success(response) => { panic("conflicting framing should fail") }
         failure(error) => { assert(error.kind == HTTP.ErrorKind.malformed_message) }
     }
@@ -462,21 +462,21 @@ test "reject conflicting response framing" {
 
 test "parse and encode query parameters" {
     var url = HTTP.Url(scheme:"https", host:"example.com", port:443, target:"/")
-    match HTTP.Url.parse("https://example.com/search?q=Silex+HTTP&tag=a%2Fb&tag=second") {
+    match (try HTTP.Url.parse("https://example.com/search?q=Silex+HTTP&tag=a%2Fb&tag=second")) {
         failure(error) => { panic(error.detail) }
         success(value) => { url = value }
     }
     assert(url.path() == "/search")
     if let query = url.query() { assert(query == "q=Silex+HTTP&tag=a%2Fb&tag=second") }
     else { panic("query should be present") }
-    match url.query_parameter("q") {
+    match (try url.query_parameter("q")) {
         failure(error) => { panic(error.detail) }
         success(value) => {
             if let text = value { assert(text == "Silex HTTP") }
             else { panic("q should be present") }
         }
     }
-    let parameters = require_parameters(url.query_parameters())
+    let parameters = require_parameters((try url.query_parameters()))
     assert(parameters.count() == 3)
     assert(parameters[1].name == "tag" && parameters[1].value == "a/b")
     assert(HTTP.encode_query_component("Silex & HTTP") == "Silex%20%26%20HTTP")
@@ -487,23 +487,23 @@ test "parse and encode query parameters" {
 }
 
 test "resolve relative redirect locations" {
-    let base = require_url(HTTP.Url.parse("https://example.com/docs/guide/index.html?old=1"))
-    let sibling = require_url(base.resolve("../api?q=1"))
+    let base = require_url((try HTTP.Url.parse("https://example.com/docs/guide/index.html?old=1")))
+    let sibling = require_url((try base.resolve("../api?q=1")))
     assert(sibling.scheme == "https")
     assert(sibling.authority() == "example.com")
     assert(sibling.target == "/docs/api?q=1")
-    let absolute = require_url(base.resolve("/health"))
+    let absolute = require_url((try base.resolve("/health")))
     assert(absolute.target == "/health")
 }
 
 test "require exactly one Host header in HTTP 1.1 requests" {
     var missing = MemoryStream("GET / HTTP/1.1\r\n\r\n")
-    match Codec.read_request(missing, HTTP.default_limits()) {
+    match (try Codec.read_request(missing, HTTP.default_limits())) {
         success(request) => { panic("missing Host should fail") }
         failure(error) => { assert(error.kind == HTTP.ErrorKind.malformed_message) }
     }
     var repeated = MemoryStream("GET / HTTP/1.1\r\nHost: one\r\nHost: two\r\n\r\n")
-    match Codec.read_request(repeated, HTTP.default_limits()) {
+    match (try Codec.read_request(repeated, HTTP.default_limits())) {
         success(request) => { panic("repeated Host should fail") }
         failure(error) => { assert(error.kind == HTTP.ErrorKind.malformed_message) }
     }
@@ -514,19 +514,19 @@ test "skip bounded informational responses" {
         "HTTP/1.1 100 Continue\r\nX-Interim: yes\r\n\r\n" +
         "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"
     )
-    var response = require_response(Codec.read_response(stream, HTTP.default_limits(), true))
+    var response = require_response((try Codec.read_response(stream, HTTP.default_limits(), true)))
     assert(response.status() == 200)
-    assert(require_text(response.text()) == "hello")
+    assert(require_text((try response.text())) == "hello")
 }
 
 test "reject malformed status separators and framing trailers" {
     var status = MemoryStream("HTTP/1.1 200Xbad\r\nContent-Length: 0\r\n\r\n")
-    match Codec.read_response(status, HTTP.default_limits(), true) {
+    match (try Codec.read_response(status, HTTP.default_limits(), true)) {
         success(response) => { panic("invalid status separator should fail") }
         failure(error) => { assert(error.kind == HTTP.ErrorKind.malformed_message) }
     }
     var missing_space = MemoryStream("HTTP/1.1 200\r\nContent-Length: 0\r\n\r\n")
-    match Codec.read_response(missing_space, HTTP.default_limits(), true) {
+    match (try Codec.read_response(missing_space, HTTP.default_limits(), true)) {
         success(response) => { panic("status line without trailing space should fail") }
         failure(error) => { assert(error.kind == HTTP.ErrorKind.malformed_message) }
     }
@@ -534,7 +534,7 @@ test "reject malformed status separators and framing trailers" {
         "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" +
         "1\r\na\r\n0\r\nContent-Length: 1\r\n\r\n"
     )
-    match Codec.read_response(trailer, HTTP.default_limits(), true) {
+    match (try Codec.read_response(trailer, HTTP.default_limits(), true)) {
         success(response) => { panic("framing trailer should fail") }
         failure(error) => { assert(error.kind == HTTP.ErrorKind.malformed_message) }
     }
@@ -546,7 +546,7 @@ test "stream decoded response bodies to a writer" {
         "5\r\nHello\r\n6\r\n Silex\r\n0\r\n\r\n"
     )
     var output = MemoryStream("")
-    var response = require_response(Codec.read_response_to(input, output, HTTP.default_limits(), true))
+    var response = require_response((try Codec.read_response_to(input, output, HTTP.default_limits(), true)))
     assert(response.status() == 200)
     let buffered = response.body()
     assert(buffered.count() == 0)
@@ -559,7 +559,7 @@ test "stream encoded request bodies from a reader" {
     var request = HTTP.Request.post("/upload")
     request.headers().set("Host", "example.com")
     request.headers().set("Content-Type", "application/octet-stream")
-    match Codec.write_request_from(output, request, input, 8, HTTP.default_limits().maximum_body_bytes) {
+    match (try Codec.write_request_from(output, request, input, 8, HTTP.default_limits().maximum_body_bytes)) {
         failure(error) => { panic(error.detail) }
         success => {}
     }
@@ -576,7 +576,7 @@ test "stream encoded request bodies from a reader" {
 test "make unsuccessful status handling explicit" {
     var response = HTTP.Response.text(404, "missing")
     assert(!response.is_success())
-    match response.require_success() {
+    match (try response.require_success()) {
         success => { panic("404 should not be successful") }
         failure(error) => {
             assert(error.kind == HTTP.ErrorKind.http_status)
@@ -591,7 +591,7 @@ test "rewrite and sanitize redirected requests" {
     request.set_text("credentials")
     request.headers().set("Authorization", "Bearer secret")
     request.headers().set("Cookie", "session=secret")
-    let destination = require_url(HTTP.Url.parse("https://other.example/welcome"))
+    let destination = require_url((try HTTP.Url.parse("https://other.example/welcome")))
     var redirected = Client.redirect_request(request, 302, destination, false)
     assert(redirected.method() == HTTP.Method.get)
     assert(redirected.target() == "/welcome")
@@ -604,25 +604,25 @@ test "rewrite and sanitize redirected requests" {
     var preserved = Client.redirect_request(request, 307, destination, true)
     assert(preserved.method() == HTTP.Method.post)
     assert(preserved.headers().contains("Authorization"))
-    assert(require_text(preserved.text()) == "credentials")
+    assert(require_text((try preserved.text())) == "credentials")
 }
 
 test "construct untrusted HTTP values without panicking" {
     var headers = HTTP.Headers()
-    match headers.try_append("Bad Header", "value") {
+    match (try headers.append("Bad Header", "value")) {
         success => { panic("invalid header name should fail") }
         failure(error) => { assert(error.kind == HTTP.ErrorKind.invalid_header) }
     }
-    match headers.try_set("X-Test", "line\nfeed") {
+    match (try headers.set("X-Test", "line\nfeed")) {
         success => { panic("invalid header value should fail") }
         failure(error) => { assert(error.kind == HTTP.ErrorKind.invalid_header) }
     }
     assert(headers.count() == 0)
-    match HTTP.Request.try_new(HTTP.Method.custom("BAD METHOD"), "/") {
+    match (try HTTP.Request.new(HTTP.Method.custom("BAD METHOD"), "/")) {
         success(request) => { panic("invalid custom method should fail") }
         failure(error) => { assert(error.kind == HTTP.ErrorKind.invalid_request) }
     }
-    match HTTP.Response.try_new(42) {
+    match (try HTTP.Response.new(42)) {
         success(response) => { panic("invalid response status should fail") }
         failure(error) => { assert(error.kind == HTTP.ErrorKind.invalid_response) }
     }
@@ -665,35 +665,35 @@ test "configure client and server time budgets fluently" {
 test "configure an explicitly owned client session" {
     let options = Client.default_options().with_maximum_idle_connections_per_origin(2)
     assert(options.maximum_idle_connections_per_origin == 2)
-    var session = require_session(Client.Session.create(options))
+    var session = require_session((try Client.Session.create(options)))
     assert(!session.is_closed())
     assert(session.idle_connection_count() == 0)
-    match session.set_default_header("Accept", "application/json") {
+    match (try session.set_default_header("Accept", "application/json")) {
         success => {}
         failure(error) => { panic(error.detail) }
     }
-    match session.set_default_header("Bad Header", "value") {
+    match (try session.set_default_header("Bad Header", "value")) {
         success => { panic("invalid session default header should fail") }
         failure(error) => { assert(error.kind == HTTP.ErrorKind.invalid_header) }
     }
-    match session.authenticate_bearer("") {
+    match (try session.authenticate_bearer("")) {
         success => { panic("empty bearer token should fail") }
         failure(error) => { assert(error.kind == HTTP.ErrorKind.invalid_configuration) }
     }
     session.enable_cookies()
     assert(session.cookies_enabled())
-    match session.close() {
+    match (try session.close()) {
         success => {}
         failure(error) => { panic(error.detail) }
     }
     assert(session.is_closed())
-    match session.close() {
+    match (try session.close()) {
         success => {}
         failure(error) => { panic("session close should be idempotent") }
     }
-    match Client.Session.create(
+    match (try Client.Session.create(
         Client.default_options().with_maximum_idle_connections_per_origin(-1)
-    ) {
+    )) {
         success(invalid) => { panic("negative pool size should fail") }
         failure(error) => { assert(error.kind == HTTP.ErrorKind.invalid_configuration) }
     }
@@ -720,7 +720,7 @@ test "reject non-public resolved endpoints with the optional client policy" {
 test "stop codec work when the total deadline expires" {
     var stream = MemoryStream("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
     var deadline = HTTP.DeadlineBudget(0)
-    match Codec.read_response(stream, HTTP.default_limits(), true, deadline) {
+    match (try Codec.read_response(stream, HTTP.default_limits(), true, deadline)) {
         success(response) => { panic("expired deadline should fail") }
         failure(error) => { assert(error.kind == HTTP.ErrorKind.deadline_exceeded) }
     }
@@ -732,9 +732,9 @@ test "stream fixed and chunked server responses" {
     var fixed_response = HTTP.Response(200, "OK")
     fixed_response.headers().set("Content-Type", "application/octet-stream")
     var fixed_deadline = HTTP.DeadlineBudget(null)
-    match Codec.write_response_from(
+    match (try Codec.write_response_from(
         fixed_output, fixed_response, fixed_input, 8, 32, true, fixed_deadline
-    ) {
+    )) {
         success => {}
         failure(error) => { panic(error.detail) }
     }
@@ -749,9 +749,9 @@ test "stream fixed and chunked server responses" {
     var chunked_output = MemoryStream("")
     var chunked_response = HTTP.Response(200, "OK")
     var chunked_deadline = HTTP.DeadlineBudget(null)
-    match Codec.write_response_chunked(
+    match (try Codec.write_response_chunked(
         chunked_output, chunked_response, chunked_input, 32, true, chunked_deadline
-    ) {
+    )) {
         success => {}
         failure(error) => { panic(error.detail) }
     }

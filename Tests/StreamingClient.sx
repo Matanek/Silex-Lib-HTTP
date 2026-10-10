@@ -17,7 +17,7 @@ class TextWriter:IO.Writer {
 
     func text() str {
         if self.bytes.is_empty() { return "" }
-        match UTF8.decode(@self.bytes[0:self.bytes.count()]) {
+        match (try UTF8.decode(@self.bytes[0:self.bytes.count()])) {
             success(value) => { return value }
             failure(error) => { panic("streamed response is not UTF-8") }
         }
@@ -27,26 +27,26 @@ class TextWriter:IO.Writer {
 func run(port:uint16) Result<void, HTTP.Error> {
     let origin = "http://127.0.0.1:$(port)"
 
-    var progressive = try Client.open(origin + "/chunked")
-    let prefix = try progressive.read(4)
+    var progressive = try Client.open(origin + "/chunked") else error { return Result<void,HTTP.Error>.failure(error) }
+    let prefix = try progressive.read(4) else error { return Result<void,HTTP.Error>.failure(error) }
     assert(prefix.count() == 4)
-    let remainder = try progressive.read_all()
+    let remainder = try progressive.read_all() else error { return Result<void,HTTP.Error>.failure(error) }
     assert(remainder.count() == 10)
-    try progressive.close()
+    try progressive.close() else error { return Result<void,HTTP.Error>.failure(error) }
 
     var output = TextWriter()
-    var known = try Client.open(origin + "/known")
-    let copied = try known.copy_to<TextWriter>(output)
+    var known = try Client.open(origin + "/known") else error { return Result<void,HTTP.Error>.failure(error) }
+    let copied = try known.copy_to<TextWriter>(output) else error { return Result<void,HTTP.Error>.failure(error) }
     assert(copied == 12)
     assert(output.text() == "known stream")
-    try known.close()
+    try known.close() else error { return Result<void,HTTP.Error>.failure(error) }
 
     print("progressive and fixed-length response streaming verified")
     return Result<void, HTTP.Error>.success()
 }
 
 func selected_port() uint16 {
-    match Process.arguments() {
+    match (try Process.arguments()) {
         success(arguments) => {
             if arguments.count() > 1 { return parse_port(arguments[1]) }
         }
@@ -67,7 +67,7 @@ func parse_port(text:str) uint16 {
 }
 
 func main() {
-    match run(selected_port()) {
+    match (try run(selected_port())) {
         success => {}
         failure(error) => { panic(error.detail) }
     }

@@ -20,7 +20,7 @@ public struct MediaType {
     let parameters:MediaParameter[]
 
     static func parse(value:str) Result<MediaType, HTTPError> {
-        return parse_media_type(value)
+        return (try parse_media_type(value))
     }
 
     func parameter(name:str) str? {
@@ -52,7 +52,7 @@ public struct ContentDisposition {
 
     static func parse(value:str) Result<ContentDisposition, HTTPError> {
         var pieces = ParameterizedValue(primary:"", parameters:[])
-        match parse_parameterized(value, "Content-Disposition") {
+        match (try parse_parameterized(value, "Content-Disposition")) {
             success(parsed) => { pieces = parsed }
             failure(error) => {
                 return Result<ContentDisposition, Error>.failure(error)
@@ -106,7 +106,7 @@ struct ParameterizedValue {
 }
 
 func parse_media_type(value:str) Result<MediaType, HTTPError> {
-    let pieces = try parse_parameterized(value, "Content-Type")
+    let pieces = try parse_parameterized(value, "Content-Type") else error { return Result<MediaType,HTTPError>.failure(error) }
     let primary = UTF8.bytes(pieces.primary)
     var slash = -1
     var index = 0
@@ -183,7 +183,7 @@ func parse_parameterized(value:str, subject:str) Result<ParameterizedValue, HTTP
                 ErrorKind.malformed_message, value, subject + " contains an invalid parameter"
             ))
         }
-        let decoded = try decode_parameter(raw, value)
+        let decoded = try decode_parameter(raw, value) else error { return Result<ParameterizedValue,HTTPError>.failure(error) }
         for existing in parameters {
             if existing.name == name {
                 return Result<ParameterizedValue, Error>.failure(http_error(

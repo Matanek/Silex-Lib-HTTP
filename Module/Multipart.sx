@@ -59,7 +59,7 @@ public class MultipartReader<R:IO.Reader> {
         if self.complete { return Result<MultipartPart?, Error>.success(null) }
         if !self.started {
             var opening = ""
-            match self.read_line(self.limits.maximum_header_bytes) {
+            match (try self.read_line(self.limits.maximum_header_bytes)) {
                 success(value) => { opening = value }
                 failure(error) => { return Result<MultipartPart?, Error>.failure(error) }
             }
@@ -80,7 +80,7 @@ public class MultipartReader<R:IO.Reader> {
         while true {
             let remaining = self.limits.maximum_header_bytes - consumed
             var line = ""
-            match self.read_line(remaining) {
+            match (try self.read_line(remaining)) {
                 success(value) => { line = value }
                 failure(error) => { return Result<MultipartPart?, Error>.failure(error) }
             }
@@ -93,11 +93,11 @@ public class MultipartReader<R:IO.Reader> {
                 ))
             }
             var header = Header(name:"", value:"")
-            match parse_part_header(line) {
+            match (try parse_part_header(line)) {
                 success(value) => { header = value }
                 failure(error) => { return Result<MultipartPart?, Error>.failure(error) }
             }
-            match headers.try_append(header.name, header.value) {
+            match (try headers.append(header.name, header.value)) {
                 success => {}
                 failure(error) => { return Result<MultipartPart?, Error>.failure(error) }
             }
@@ -105,7 +105,7 @@ public class MultipartReader<R:IO.Reader> {
         var name:str? = null
         var filename:str? = null
         if let value = headers.get("Content-Disposition") {
-            match ContentDisposition.parse(value) {
+            match (try ContentDisposition.parse(value)) {
                 success(disposition) => {
                     name = disposition.name()
                     filename = disposition.filename()
@@ -115,7 +115,7 @@ public class MultipartReader<R:IO.Reader> {
         }
         var content_type:MediaType? = null
         if let value = headers.get("Content-Type") {
-            match MediaType.parse(value) {
+            match (try MediaType.parse(value)) {
                 success(media) => { content_type = media }
                 failure(error) => { return Result<MultipartPart?, Error>.failure(error) }
             }
@@ -135,7 +135,7 @@ public class MultipartReader<R:IO.Reader> {
         var result:uint8[] = []
         while self.active {
             var bytes:uint8[] = []
-            match self.read_part_chunk() {
+            match (try self.read_part_chunk()) {
                 success(value) => { bytes = value }
                 failure(error) => { return Result<uint8[], Error>.failure(error) }
             }
@@ -158,7 +158,7 @@ public class MultipartReader<R:IO.Reader> {
         var output:uint8[] = []
         while self.active && output.count() < maximum_bytes {
             var byte:uint8? = null
-            match self.read_byte() {
+            match (try self.read_byte()) {
                 success(value) => { byte = value }
                 failure(error) => { return Result<uint8[], Error>.failure(error) }
             }
@@ -184,11 +184,11 @@ public class MultipartReader<R:IO.Reader> {
             if self.pending.count() == self.marker.count() {
                 var first:uint8 = 0
                 var second:uint8 = 0
-                match self.required_byte("multipart boundary suffix") {
+                match (try self.required_byte("multipart boundary suffix")) {
                     success(value) => { first = value }
                     failure(error) => { return Result<uint8[], Error>.failure(error) }
                 }
-                match self.required_byte("multipart boundary suffix") {
+                match (try self.required_byte("multipart boundary suffix")) {
                     success(value) => { second = value }
                     failure(error) => { return Result<uint8[], Error>.failure(error) }
                 }
@@ -213,7 +213,7 @@ public class MultipartReader<R:IO.Reader> {
 
     func discard_part() Result<void, Error> {
         while self.active {
-            match self.read_part_chunk() {
+            match (try self.read_part_chunk()) {
                 success(bytes) => {}
                 failure(error) => { return Result<void, Error>.failure(error) }
             }
@@ -230,13 +230,13 @@ public class MultipartReader<R:IO.Reader> {
         var bytes:uint8[] = []
         while bytes.count() <= maximum_bytes {
             var byte:uint8 = 0
-            match self.required_byte("multipart line") {
+            match (try self.required_byte("multipart line")) {
                 success(value) => { byte = value }
                 failure(error) => { return Result<str, Error>.failure(error) }
             }
             if byte == 13 {
                 var ending:uint8 = 0
-                match self.required_byte("multipart line ending") {
+                match (try self.required_byte("multipart line ending")) {
                     success(value) => { ending = value }
                     failure(error) => { return Result<str, Error>.failure(error) }
                 }
@@ -261,7 +261,7 @@ public class MultipartReader<R:IO.Reader> {
 
     private func required_byte(subject:str) Result<uint8, Error> {
         var value:uint8? = null
-        match self.read_byte() {
+        match (try self.read_byte()) {
             success(byte) => { value = byte }
             failure(error) => { return Result<uint8, Error>.failure(error) }
         }
@@ -275,7 +275,7 @@ public class MultipartReader<R:IO.Reader> {
         var buffer:uint8[1] = [0]
         var view = &buffer[0:1]
         if var input = self.input {
-            match input.read(view) {
+            match (try input.read(view)) {
                 success(count) => {
                     if count == 0 { return Result<uint8?, Error>.success(null) }
                     if count != 1 {
@@ -310,7 +310,7 @@ public func multipart<R:IO.Reader>(
     input:R,
     content_type:MediaType
 ) Result<MultipartReader<R>, Error> {
-    return multipart(input, content_type, default_multipart_options())
+    return (try multipart(input, content_type, default_multipart_options()))
 }
 
 public func multipart<R:IO.Reader>(

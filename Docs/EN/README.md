@@ -10,9 +10,9 @@ UTF-8 text to `JSON.parse`, `HTML.parse`, `YAML.parse`, or another package.
 use HTTP.Client
 use JSON
 
-var response = try Client.get("https://example.com/api?limit=10")
-try response.require_success()
-let data = JSON.parse(try response.text())
+var response = Client.get("https://example.com/api?limit=10")
+response.require_success()
+var data = JSON.parse(response.text())
 ```
 
 The `get`, `head`, `delete`, `post`, `put`, and `patch` operations cover common
@@ -29,18 +29,18 @@ and rejects HTTPS-to-HTTP downgrades.
 A `Client.Session` owns its configuration and connection pool.
 
 ```sx
-var session = try Client.Session.create(
+var session = Client.Session.create(
     Client.default_options().with_maximum_idle_connections_per_origin(4)
 )
-try session.set_default_header("Accept", "application/json")
-try session.authenticate_bearer(token)
+session.set_default_header("Accept", "application/json")
+session.authenticate_bearer(token)
 session.enable_cookies()
 
-var exchange = try session.get("https://example.com/api")
+var exchange = session.get("https://example.com/api")
 print(exchange.final_url.text())
 print(exchange.redirects.count())
 
-try session.close()
+session.close()
 ```
 
 Request-specific headers take precedence over defaults. Cookies are disabled
@@ -98,8 +98,8 @@ func handle(request:@HTTP.Request) HTTP.Response {
     return HTTP.Response.text(404, "Not found")
 }
 
-var server = try Server.listen("127.0.0.1", 8080)
-try server.serve(handle)
+var server = Server.listen("127.0.0.1", 8080)
+server.serve(handle)
 ```
 
 `HTTP.Server.Router` maps methods and paths. `:name` captures one segment and a

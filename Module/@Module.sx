@@ -83,7 +83,7 @@ package class DeadlineBudget {
     }
 
     func bounded_timeout(configured:int?, subject:str) Result<int?, Error> {
-        match self.check(subject) {
+        match (try self.check(subject)) {
             success => {}
             failure(error) => { return Result<int?, Error>.failure(error) }
         }
@@ -123,7 +123,7 @@ public struct Url {
     let port:uint16
     let target:str
 
-    static func parse(value:str) Result<Url, Error> { return parse_url(value) }
+    static func parse(value:str) Result<Url, Error> { return (try parse_url(value)) }
 
     func authority() str {
         var name = self.host
@@ -138,9 +138,9 @@ public struct Url {
 
     func path() str { return target_path(self.target) }
     func query() str? { return target_query(self.target) }
-    func query_parameters() Result<QueryParameter[], Error> { return parse_query(self.target) }
-    func query_parameter(name:str) Result<str?, Error> { return find_query_parameter(self.target, name) }
-    func resolve(location:str) Result<Url, Error> { return resolve_url(self, location) }
+    func query_parameters() Result<QueryParameter[], Error> { return (try parse_query(self.target)) }
+    func query_parameter(name:str) Result<str?, Error> { return (try find_query_parameter(self.target, name)) }
+    func resolve(location:str) Result<Url, Error> { return (try resolve_url(self, location)) }
 }
 
 public class Headers {
@@ -170,15 +170,9 @@ public class Headers {
 
     func contains(name:str) bool { return self.get(name) != null }
 
-    func append(name:str, value:str) {
-        match self.try_append(name, value) {
-            success => {}
-            failure(error) => { panic(error.detail) }
-        }
-    }
 
-    func try_append(name:str, value:str) Result<void, Error> {
-        match validate_header(name, value) {
+    func append(name:str, value:str) Result<void, Error> {
+        match (try validate_header(name, value)) {
             success => {}
             failure(error) => { return Result<void, Error>.failure(error) }
         }
@@ -186,15 +180,9 @@ public class Headers {
         return Result<void, Error>.success()
     }
 
-    func set(name:str, value:str) {
-        match self.try_set(name, value) {
-            success => {}
-            failure(error) => { panic(error.detail) }
-        }
-    }
 
-    func try_set(name:str, value:str) Result<void, Error> {
-        match validate_header(name, value) {
+    func set(name:str, value:str) Result<void, Error> {
+        match (try validate_header(name, value)) {
             success => {}
             failure(error) => { return Result<void, Error>.failure(error) }
         }
@@ -235,7 +223,7 @@ public class Request {
         self.request_peer = null
     }
 
-    static func try_new(method:Method, target:str) Result<Request, Error> {
+    static func new(method:Method, target:str) Result<Request, Error> {
         if !valid_method_text(method_text(method)) {
             return Result<Request, Error>.failure(failure(
                 ErrorKind.invalid_request,
@@ -264,9 +252,9 @@ public class Request {
     func target() str { return self.request_target }
     func path() str { return target_path(self.request_target) }
     func query() str? { return target_query(self.request_target) }
-    func query_parameters() Result<QueryParameter[], Error> { return parse_query(self.request_target) }
+    func query_parameters() Result<QueryParameter[], Error> { return (try parse_query(self.request_target)) }
     func query_parameter(name:str) Result<str?, Error> {
-        return find_query_parameter(self.request_target, name)
+        return (try find_query_parameter(self.request_target, name))
     }
     func peer() Network.Endpoint? { return self.request_peer }
     func headers() Headers { return self.request_headers }
@@ -279,7 +267,7 @@ public class Request {
         self.request_headers.set("Content-Type", content_type)
     }
 
-    func text() Result<str, Error> { return decode_text(self.request_body, "HTTP request body") }
+    func text() Result<str, Error> { return (try decode_text(self.request_body, "HTTP request body")) }
 
     package func replace_headers(headers:Headers) { self.request_headers = headers }
     package func set_peer(endpoint:Network.Endpoint) { self.request_peer = endpoint }
@@ -300,7 +288,7 @@ public class Response {
         self.response_body = []
     }
 
-    static func try_new(status:int, reason:str = "") Result<Response, Error> {
+    static func new(status:int, reason:str = "") Result<Response, Error> {
         if status < 100 || status > 999 {
             return Result<Response, Error>.failure(failure(
                 ErrorKind.invalid_response,
@@ -346,7 +334,7 @@ public class Response {
             self.response_status == 307 || self.response_status == 308
     }
     func location() str? { return self.response_headers.get("Location") }
-    func text() Result<str, Error> { return decode_text(self.response_body, "HTTP response body") }
+    func text() Result<str, Error> { return (try decode_text(self.response_body, "HTTP response body")) }
 
     func require_success() Result<void, Error> {
         if self.is_success() { return Result<void, Error>.success() }
@@ -410,7 +398,7 @@ public func decode_query_component(value:str) Result<str, Error> {
         index++
     }
     if decoded.is_empty() { return Result<str, Error>.success("") }
-    match UTF8.decode(@decoded[0:decoded.count()]) {
+    match (try UTF8.decode(@decoded[0:decoded.count()])) {
         success(text) => { return Result<str, Error>.success(text) }
         failure(error) => {
             return Result<str, Error>.failure(failure(
@@ -501,7 +489,7 @@ package func decimal(value:int) str {
 
 package func text_from_bytes(bytes:uint8[]) str {
     if bytes.count() == 0 { return "" }
-    match UTF8.decode(@bytes[0:bytes.count()]) {
+    match (try UTF8.decode(@bytes[0:bytes.count()])) {
         success(text) => { return text }
         failure(error) => { panic("internal HTTP text is not UTF-8") }
     }
@@ -509,7 +497,7 @@ package func text_from_bytes(bytes:uint8[]) str {
 
 func decode_text(bytes:uint8[], subject:str) Result<str, Error> {
     if bytes.count() == 0 { return Result<str, Error>.success("") }
-    match UTF8.decode(@bytes[0:bytes.count()]) {
+    match (try UTF8.decode(@bytes[0:bytes.count()])) {
         success(text) => { return Result<str, Error>.success(text) }
         failure(error) => {
             return Result<str, Error>.failure(failure(
@@ -571,7 +559,7 @@ func parse_url(value:str) Result<Url, Error> {
             if authority_bytes[closing + 1] != 58 {
                 return Result<Url, Error>.failure(failure(ErrorKind.invalid_url, value, "invalid text after IPv6 host"))
             }
-            match parse_port(byte_slice(authority_bytes, closing + 2, authority_bytes.count()), value) {
+            match (try parse_port(byte_slice(authority_bytes, closing + 2, authority_bytes.count()), value)) {
                 success(parsed) => { port = parsed }
                 failure(error) => { return Result<Url, Error>.failure(error) }
             }
@@ -585,7 +573,7 @@ func parse_url(value:str) Result<Url, Error> {
         }
         if colon >= 0 {
             host = byte_slice(authority_bytes, 0, colon)
-            match parse_port(byte_slice(authority_bytes, colon + 1, authority_bytes.count()), value) {
+            match (try parse_port(byte_slice(authority_bytes, colon + 1, authority_bytes.count()), value)) {
                 success(parsed) => { port = parsed }
                 failure(error) => { return Result<Url, Error>.failure(error) }
             }
@@ -620,20 +608,20 @@ func resolve_url(base:Url, location:str) Result<Url, Error> {
         ))
     }
     if starts_with_text(ascii_lower(trimmed), "http://") || starts_with_text(ascii_lower(trimmed), "https://") {
-        return Url.parse(trimmed)
+        return (try Url.parse(trimmed))
     }
     let prefix = base.scheme + "://" + base.authority()
-    if starts_with_text(trimmed, "//") { return Url.parse(base.scheme + ":" + trimmed) }
-    if starts_with_text(trimmed, "/") { return Url.parse(prefix + trimmed) }
-    if starts_with_text(trimmed, "?") { return Url.parse(prefix + base.path() + trimmed) }
-    if starts_with_text(trimmed, "#") { return Url.parse(prefix + base.target + trimmed) }
+    if starts_with_text(trimmed, "//") { return (try Url.parse(base.scheme + ":" + trimmed)) }
+    if starts_with_text(trimmed, "/") { return (try Url.parse(prefix + trimmed)) }
+    if starts_with_text(trimmed, "?") { return (try Url.parse(prefix + base.path() + trimmed)) }
+    if starts_with_text(trimmed, "#") { return (try Url.parse(prefix + base.target + trimmed)) }
     let path = base.path()
     let bytes = UTF8.bytes(path)
     var slash = bytes.count() - 1
     while slash >= 0 && bytes[slash] != 47 { slash-- }
     var directory = "/"
     if slash >= 0 { directory = byte_slice(bytes, 0, slash + 1) }
-    return Url.parse(prefix + normalize_path(directory + trimmed))
+    return (try Url.parse(prefix + normalize_path(directory + trimmed)))
 }
 
 func target_path(target:str) str {
@@ -685,8 +673,8 @@ func parse_query(target:str) Result<QueryParameter[], Error> {
                     raw_name = byte_slice(item_bytes, 0, equals)
                     raw_value = byte_slice(item_bytes, equals + 1, item_bytes.count())
                 }
-                let name = try decode_query_component(raw_name)
-                let value = try decode_query_component(raw_value)
+                let name = try decode_query_component(raw_name) else error { return Result<QueryParameter[],Error>.failure(error) }
+                let value = try decode_query_component(raw_value) else error { return Result<QueryParameter[],Error>.failure(error) }
                 result.append(QueryParameter(name:name, value:value))
                 start = index + 1
             }
@@ -697,7 +685,7 @@ func parse_query(target:str) Result<QueryParameter[], Error> {
 }
 
 func find_query_parameter(target:str, expected:str) Result<str?, Error> {
-    let parameters = try parse_query(target)
+    let parameters = try parse_query(target) else error { return Result<str?,Error>.failure(error) }
     for parameter in parameters {
         if parameter.name == expected { return Result<str?, Error>.success(parameter.value) }
     }

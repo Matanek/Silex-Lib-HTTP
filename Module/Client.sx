@@ -18,7 +18,7 @@ public struct Proxy {
 
     static func parse(value:str) Result<Proxy, HTTP.Error> {
         var parsed = empty_url()
-        match HTTP.Url.parse(value) {
+        match (try HTTP.Url.parse(value)) {
             success(url) => { parsed = url }
             failure(error) => { return Result<Proxy, HTTP.Error>.failure(error) }
         }
@@ -54,7 +54,7 @@ public struct Proxy {
         }
         let value = "Bearer " + token
         var headers = HTTP.Headers()
-        match headers.try_set("Proxy-Authorization", value) {
+        match (try headers.set("Proxy-Authorization", value)) {
             success => {}
             failure(error) => { return Result<Proxy, HTTP.Error>.failure(error) }
         }
@@ -274,16 +274,16 @@ package class Connection:IO.Reader, IO.Writer {
     static func secure(stream:TLS.Stream) Connection { return Connection(null, stream) }
 
     func read(buffer:&uint8[..]) Result<int, StandardError> {
-        if var stream = self.tcp { return stream.read(buffer) }
-        if var stream = self.tls { return stream.read(buffer) }
+        if var stream = self.tcp { return (try stream.read(buffer)) }
+        if var stream = self.tls { return (try stream.read(buffer)) }
         return Result<int, StandardError>.failure(standard_error(
             "http.read", "HTTP response connection is closed"
         ))
     }
 
     func write(buffer:@uint8[..]) Result<int, StandardError> {
-        if var stream = self.tcp { return stream.write(buffer) }
-        if var stream = self.tls { return stream.write(buffer) }
+        if var stream = self.tcp { return (try stream.write(buffer)) }
+        if var stream = self.tls { return (try stream.write(buffer)) }
         return Result<int, StandardError>.failure(standard_error(
             "http.write", "HTTP response connection is closed"
         ))
@@ -292,7 +292,7 @@ package class Connection:IO.Reader, IO.Writer {
     func close() Result<void, HTTP.Error> {
         if var stream = self.tcp {
             self.tcp = null
-            match TCP.close(move stream) {
+            match (try TCP.close(move stream)) {
                 success => { return Result<void, HTTP.Error>.success() }
                 failure(error) => {
                     return Result<void, HTTP.Error>.failure(HTTP.failure(
@@ -303,7 +303,7 @@ package class Connection:IO.Reader, IO.Writer {
         }
         if var stream = self.tls {
             self.tls = null
-            match TLS.close(stream) {
+            match (try TLS.close(stream)) {
                 success => { return Result<void, HTTP.Error>.success() }
                 failure(error) => {
                     return Result<void, HTTP.Error>.failure(HTTP.failure(
@@ -315,7 +315,7 @@ package class Connection:IO.Reader, IO.Writer {
         return Result<void, HTTP.Error>.success()
     }
 
-    drop { match self.close() { success => {}; failure(error) => {} } }
+    drop { match (try self.close()) { success => {}; failure(error) => {} } }
 }
 
 public struct RedirectHop {
@@ -389,7 +389,7 @@ public class IncomingResponse {
         expect_body:bool,
         deadline:HTTP.DeadlineBudget
     ) Result<IncomingResponse, HTTP.Error> {
-        return IncomingResponse.start(
+        return (try IncomingResponse.start(
             metadata,
             connection,
             limits,
@@ -402,7 +402,7 @@ public class IncomingResponse {
                 resolved_url:empty_url(),
                 redirects:[]
             )
-        )
+        ))
     }
 
     package static func start(
@@ -414,7 +414,7 @@ public class IncomingResponse {
         context:IncomingContext
     ) Result<IncomingResponse, HTTP.Error> {
         var framing = Codec.BodyFraming(kind:0, length:0)
-        match Codec.body_framing(metadata.headers()) {
+        match (try Codec.body_framing(metadata.headers())) {
             success(value) => { framing = value }
             failure(error) => { return Result<IncomingResponse, HTTP.Error>.failure(error) }
         }
@@ -455,7 +455,7 @@ public class IncomingResponse {
                 var count = self.remaining
                 if count > maximum_bytes { count = maximum_bytes }
                 var bytes:uint8[] = []
-                match Codec.read_count<Connection>(stream, count, self.deadline_value()) {
+                match (try Codec.read_count<Connection>(stream, count, self.deadline_value())) {
                     success(value) => { bytes = value }
                     failure(error) => { return Result<uint8[], HTTP.Error>.failure(error) }
                 }
@@ -464,8 +464,8 @@ public class IncomingResponse {
                 if self.remaining == 0 { self.complete = true; self.finish_connection() }
                 return Result<uint8[], HTTP.Error>.success(bytes)
             }
-            if self.framing_kind == 2 { return self.read_chunk(stream, maximum_bytes) }
-            return self.read_close_delimited(stream, maximum_bytes)
+            if self.framing_kind == 2 { return (try self.read_chunk(stream, maximum_bytes)) }
+            return (try self.read_close_delimited(stream, maximum_bytes))
         }
         return Result<uint8[], HTTP.Error>.failure(HTTP.failure(
             HTTP.ErrorKind.closed, null, "incoming HTTP response is closed"
@@ -476,7 +476,7 @@ public class IncomingResponse {
         var result:uint8[] = []
         while !self.complete {
             var bytes:uint8[] = []
-            match self.read() {
+            match (try self.read()) {
                 success(value) => { bytes = value }
                 failure(error) => { return Result<uint8[], HTTP.Error>.failure(error) }
             }
@@ -489,16 +489,16 @@ public class IncomingResponse {
         var copied = 0
         while !self.complete {
             var bytes:uint8[] = []
-            match self.read() {
+            match (try self.read()) {
                 success(value) => { bytes = value }
                 failure(error) => { return Result<int, HTTP.Error>.failure(error) }
             }
             if !bytes.is_empty() {
-                match self.deadline_value().check("HTTP response copy") {
+                match (try self.deadline_value().check("HTTP response copy")) {
                     success => {}
                     failure(error) => { return Result<int, HTTP.Error>.failure(error) }
                 }
-                match IO.write_all<W>(output, @bytes[0:bytes.count()]) {
+                match (try IO.write_all<W>(output, @bytes[0:bytes.count()])) {
                     success => {}
                     failure(error) => {
                         return Result<int, HTTP.Error>.failure(HTTP.failure(
@@ -514,7 +514,7 @@ public class IncomingResponse {
 
     func discard() Result<void, HTTP.Error> {
         while !self.complete {
-            match self.read() {
+            match (try self.read()) {
                 success(bytes) => {}
                 failure(error) => { return Result<void, HTTP.Error>.failure(error) }
             }
@@ -526,7 +526,7 @@ public class IncomingResponse {
         self.complete = true
         if var stream = self.connection {
             self.connection = null
-            return stream.close()
+            return (try stream.close())
         }
         return Result<void, HTTP.Error>.success()
     }
@@ -538,7 +538,7 @@ public class IncomingResponse {
         var connection = stream
         var result:uint8[] = []
         while result.count() < maximum_bytes {
-            match self.deadline_value().check("HTTP response body") {
+            match (try self.deadline_value().check("HTTP response body")) {
                 success => {}
                 failure(error) => { return Result<uint8[], HTTP.Error>.failure(error) }
             }
@@ -546,7 +546,7 @@ public class IncomingResponse {
             var count = 0
             {
                 var view = &byte[0:1]
-                match connection.read(view) {
+                match (try connection.read(view)) {
                     success(value) => { count = value }
                     failure(error) => {
                         return Result<uint8[], HTTP.Error>.failure(HTTP.failure(
@@ -555,7 +555,7 @@ public class IncomingResponse {
                     }
                 }
             }
-            match self.deadline_value().check("HTTP response body") {
+            match (try self.deadline_value().check("HTTP response body")) {
                 success => {}
                 failure(error) => { return Result<uint8[], HTTP.Error>.failure(error) }
             }
@@ -583,7 +583,7 @@ public class IncomingResponse {
         while self.chunk_remaining == 0 {
             var budget = self.metadata_budget
             var line = ""
-            match Codec.read_line<Connection>(connection, budget, "HTTP chunk size", self.deadline_value()) {
+            match (try Codec.read_line<Connection>(connection, budget, "HTTP chunk size", self.deadline_value())) {
                 success(value) => { line = value }
                 failure(error) => { return Result<uint8[], HTTP.Error>.failure(error) }
             }
@@ -595,7 +595,7 @@ public class IncomingResponse {
                 ))
             }
             if size == 0 {
-                match self.read_trailers(connection) {
+                match (try self.read_trailers(connection)) {
                     success => {}
                     failure(error) => { return Result<uint8[], HTTP.Error>.failure(error) }
                 }
@@ -613,7 +613,7 @@ public class IncomingResponse {
         var count = self.chunk_remaining
         if count > maximum_bytes { count = maximum_bytes }
         var bytes:uint8[] = []
-        match Codec.read_count<Connection>(connection, count, self.deadline_value()) {
+        match (try Codec.read_count<Connection>(connection, count, self.deadline_value())) {
             success(value) => { bytes = value }
             failure(error) => { return Result<uint8[], HTTP.Error>.failure(error) }
         }
@@ -621,7 +621,7 @@ public class IncomingResponse {
         self.total += bytes.count()
         if self.chunk_remaining == 0 {
             var ending:uint8[] = []
-            match Codec.read_count<Connection>(connection, 2, self.deadline_value()) {
+            match (try Codec.read_count<Connection>(connection, 2, self.deadline_value())) {
                 success(value) => { ending = value }
                 failure(error) => { return Result<uint8[], HTTP.Error>.failure(error) }
             }
@@ -640,7 +640,7 @@ public class IncomingResponse {
         while true {
             var budget = self.metadata_budget
             var line = ""
-            match Codec.read_line<Connection>(connection, budget, "HTTP trailer", self.deadline_value()) {
+            match (try Codec.read_line<Connection>(connection, budget, "HTTP trailer", self.deadline_value())) {
                 success(value) => { line = value }
                 failure(error) => { return Result<void, HTTP.Error>.failure(error) }
             }
@@ -653,7 +653,7 @@ public class IncomingResponse {
                 ))
             }
             var header = HTTP.Header(name:"", value:"")
-            match Codec.parse_header_line(line) {
+            match (try Codec.parse_header_line(line)) {
                 success(value) => { header = value }
                 failure(error) => { return Result<void, HTTP.Error>.failure(error) }
             }
@@ -667,7 +667,7 @@ public class IncomingResponse {
         panic("HTTP trailer reader terminated unexpectedly")
     }
 
-    drop { match self.close() { success => {}; failure(error) => {} } }
+    drop { match (try self.close()) { success => {}; failure(error) => {} } }
 
     private func metadata_value() HTTP.Response {
         if var value = self.metadata { return value }
@@ -725,10 +725,10 @@ public class Session {
         self.closed = false
     }
 
-    static func create() Result<Session, HTTP.Error> { return Session.create(default_options()) }
+    static func create() Result<Session, HTTP.Error> { return (try Session.create(default_options())) }
 
     static func create(options:Options) Result<Session, HTTP.Error> {
-        match validate_options(options) {
+        match (try validate_options(options)) {
             success => {}
             failure(error) => { return Result<Session, HTTP.Error>.failure(error) }
         }
@@ -741,13 +741,13 @@ public class Session {
     func cookie_count() int { return self.cookie_storage.count() }
 
     func set_default_header(name:str, value:str) Result<void, HTTP.Error> {
-        if self.closed { return session_closed_void() }
-        return self.shared_headers.try_set(name, value)
+        if self.closed { return (try session_closed_void()) }
+        return (try self.shared_headers.set(name, value))
     }
 
     func append_default_header(name:str, value:str) Result<void, HTTP.Error> {
-        if self.closed { return session_closed_void() }
-        return self.shared_headers.try_append(name, value)
+        if self.closed { return (try session_closed_void()) }
+        return (try self.shared_headers.append(name, value))
     }
 
     func remove_default_header(name:str) int {
@@ -766,13 +766,13 @@ public class Session {
                 HTTP.ErrorKind.invalid_configuration, null, "Bearer token must not be empty"
             ))
         }
-        return self.set_default_header("Authorization", "Bearer " + token)
+        return (try self.set_default_header("Authorization", "Bearer " + token))
     }
 
     func authenticate_basic(username:str, password:str) Result<void, HTTP.Error> {
-        return self.set_default_header(
+        return (try self.set_default_header(
             "Authorization", "Basic " + base64(UTF8.bytes(username + ":" + password))
-        )
+        ))
     }
 
     func clear_authentication() { self.remove_default_header("Authorization") }
@@ -787,32 +787,32 @@ public class Session {
 
     func get(url:str) Result<Exchange, HTTP.Error> {
         var parsed = empty_url()
-        match HTTP.Url.parse(url) {
+        match (try HTTP.Url.parse(url)) {
             success(value) => { parsed = value }
             failure(error) => { return Result<Exchange, HTTP.Error>.failure(error) }
         }
         var request = HTTP.Request.get(parsed.target)
-        return self.send_parsed(parsed, request)
+        return (try self.send_parsed(parsed, request))
     }
 
     func head(url:str) Result<Exchange, HTTP.Error> {
         var parsed = empty_url()
-        match HTTP.Url.parse(url) {
+        match (try HTTP.Url.parse(url)) {
             success(value) => { parsed = value }
             failure(error) => { return Result<Exchange, HTTP.Error>.failure(error) }
         }
         var request = HTTP.Request.head(parsed.target)
-        return self.send_parsed(parsed, request)
+        return (try self.send_parsed(parsed, request))
     }
 
     func delete(url:str) Result<Exchange, HTTP.Error> {
         var parsed = empty_url()
-        match HTTP.Url.parse(url) {
+        match (try HTTP.Url.parse(url)) {
             success(value) => { parsed = value }
             failure(error) => { return Result<Exchange, HTTP.Error>.failure(error) }
         }
         var request = HTTP.Request.delete(parsed.target)
-        return self.send_parsed(parsed, request)
+        return (try self.send_parsed(parsed, request))
     }
 
     func post(
@@ -820,7 +820,7 @@ public class Session {
         text:str,
         content_type:str = "text/plain; charset=utf-8"
     ) Result<Exchange, HTTP.Error> {
-        return self.send_text(HTTP.Method.post, url, text, content_type)
+        return (try self.send_text(HTTP.Method.post, url, text, content_type))
     }
 
     func put(
@@ -828,7 +828,7 @@ public class Session {
         text:str,
         content_type:str = "text/plain; charset=utf-8"
     ) Result<Exchange, HTTP.Error> {
-        return self.send_text(HTTP.Method.put, url, text, content_type)
+        return (try self.send_text(HTTP.Method.put, url, text, content_type))
     }
 
     func patch(
@@ -836,35 +836,35 @@ public class Session {
         text:str,
         content_type:str = "text/plain; charset=utf-8"
     ) Result<Exchange, HTTP.Error> {
-        return self.send_text(HTTP.Method.patch, url, text, content_type)
+        return (try self.send_text(HTTP.Method.patch, url, text, content_type))
     }
 
     func send(url:str, request:HTTP.Request) Result<Exchange, HTTP.Error> {
         var parsed = empty_url()
-        match HTTP.Url.parse(url) {
+        match (try HTTP.Url.parse(url)) {
             success(value) => { parsed = value }
             failure(error) => { return Result<Exchange, HTTP.Error>.failure(error) }
         }
-        return self.send_parsed(parsed, request)
+        return (try self.send_parsed(parsed, request))
     }
 
     func open(url:str) Result<IncomingResponse, HTTP.Error> {
         var parsed = empty_url()
-        match HTTP.Url.parse(url) {
+        match (try HTTP.Url.parse(url)) {
             success(value) => { parsed = value }
             failure(error) => { return Result<IncomingResponse, HTTP.Error>.failure(error) }
         }
         var request = HTTP.Request.get(parsed.target)
-        return self.open_parsed(parsed, request)
+        return (try self.open_parsed(parsed, request))
     }
 
     func open_request(url:str, request:HTTP.Request) Result<IncomingResponse, HTTP.Error> {
         var parsed = empty_url()
-        match HTTP.Url.parse(url) {
+        match (try HTTP.Url.parse(url)) {
             success(value) => { parsed = value }
             failure(error) => { return Result<IncomingResponse, HTTP.Error>.failure(error) }
         }
-        return self.open_parsed(parsed, request)
+        return (try self.open_parsed(parsed, request))
     }
 
     func download<W:IO.Writer>(url:str, output:&W) Result<Exchange, HTTP.Error> {
@@ -886,7 +886,7 @@ public class Session {
         var first:HTTP.Error? = null
         while !self.idle_connections.is_empty() {
             var pooled = self.idle_connections.take_last()
-            match pooled.connection.close() {
+            match (try pooled.connection.close()) {
                 success => {}
                 failure(error) => { if first == null { first = error } }
             }
@@ -909,7 +909,7 @@ public class Session {
         self.idle_connections.append(PooledConnection(origin:origin, connection:connection))
     }
 
-    drop { match self.close() { success => {}; failure(error) => {} } }
+    drop { match (try self.close()) { success => {}; failure(error) => {} } }
 
     private func send_text(
         method:HTTP.Method,
@@ -918,13 +918,13 @@ public class Session {
         content_type:str
     ) Result<Exchange, HTTP.Error> {
         var parsed = empty_url()
-        match HTTP.Url.parse(url) {
+        match (try HTTP.Url.parse(url)) {
             success(value) => { parsed = value }
             failure(error) => { return Result<Exchange, HTTP.Error>.failure(error) }
         }
         var request = HTTP.Request(method, parsed.target)
         request.set_text(text, content_type)
-        return self.send_parsed(parsed, request)
+        return (try self.send_parsed(parsed, request))
     }
 
     private func send_parsed(
@@ -932,14 +932,14 @@ public class Session {
         request:HTTP.Request
     ) Result<Exchange, HTTP.Error> {
         var incoming:IncomingResponse? = null
-        match self.open_parsed(url, request) {
+        match (try self.open_parsed(url, request)) {
             success(value) => { incoming = value }
             failure(error) => { return Result<Exchange, HTTP.Error>.failure(error) }
         }
-        if incoming == null { return session_closed_exchange() }
+        if incoming == null { return (try session_closed_exchange()) }
         var result:IncomingResponse = incoming!
         var body:uint8[] = []
-        match result.read_all() {
+        match (try result.read_all()) {
             success(value) => { body = value }
             failure(error) => {
                 close_incoming(result)
@@ -959,7 +959,7 @@ public class Session {
         url:HTTP.Url,
         request:HTTP.Request
     ) Result<IncomingResponse, HTTP.Error> {
-        if self.closed { return session_closed_incoming() }
+        if self.closed { return (try session_closed_incoming()) }
         var deadline = HTTP.DeadlineBudget(self.shared_options.total_timeout_milliseconds)
         var current_url = url
         var current_request = request
@@ -967,16 +967,16 @@ public class Session {
         var allow_sensitive_defaults = true
         while true {
             self.prepare_request(current_url, current_request, allow_sensitive_defaults)
-            match deadline.check("HTTP request") {
+            match (try deadline.check("HTTP request")) {
                 success => {}
                 failure(error) => { return Result<IncomingResponse, HTTP.Error>.failure(error) }
             }
             var incoming:IncomingResponse? = null
-            match self.open_once(current_url, current_request, deadline, redirects) {
+            match (try self.open_once(current_url, current_request, deadline, redirects)) {
                 success(value) => { incoming = value }
                 failure(error) => { return Result<IncomingResponse, HTTP.Error>.failure(error) }
             }
-            if incoming == null { return session_closed_incoming() }
+            if incoming == null { return (try session_closed_incoming()) }
             var active:IncomingResponse = incoming!
             var response = active.response()
             self.capture_cookies(current_url, response.headers())
@@ -993,7 +993,7 @@ public class Session {
                 ))
             }
             var next_url = empty_url()
-            match current_url.resolve(location) {
+            match (try current_url.resolve(location)) {
                 success(value) => { next_url = value }
                 failure(error) => {
                     close_incoming(active)
@@ -1009,7 +1009,7 @@ public class Session {
                     "HTTPS redirect to cleartext HTTP is disabled"
                 ))
             }
-            match active.discard() {
+            match (try active.discard()) {
                 success => {}
                 failure(error) => {
                     close_incoming(active)
@@ -1026,7 +1026,7 @@ public class Session {
             current_request = redirect_request(current_request, response.status(), next_url, same)
             if !same { allow_sensitive_defaults = false }
             current_url = next_url
-            match deadline.check("HTTP redirect") {
+            match (try deadline.check("HTTP redirect")) {
                 success => {}
                 failure(error) => { return Result<IncomingResponse, HTTP.Error>.failure(error) }
             }
@@ -1041,14 +1041,14 @@ public class Session {
         redirects:RedirectHop[]
     ) Result<IncomingResponse, HTTP.Error> {
         var connection:Connection? = null
-        match self.acquire(url, deadline) {
+        match (try self.acquire(url, deadline)) {
             success(value) => { connection = value }
             failure(error) => { return Result<IncomingResponse, HTTP.Error>.failure(error) }
         }
-        if connection == null { return session_closed_incoming() }
+        if connection == null { return (try session_closed_incoming()) }
         var active:Connection = connection!
         var outgoing = request_for_transport(url, request, self.shared_options)
-        match Codec.write_request<Connection>(active, outgoing, deadline) {
+        match (try Codec.write_request<Connection>(active, outgoing, deadline)) {
             success => {}
             failure(error) => {
                 close_connection(active)
@@ -1056,9 +1056,9 @@ public class Session {
             }
         }
         var response = HTTP.Response(500)
-        match Codec.read_final_response_head<Connection>(
+        match (try Codec.read_final_response_head<Connection>(
             active, self.shared_options.limits, deadline
-        ) {
+        )) {
             success(value) => { response = value }
             failure(error) => {
                 close_connection(active)
@@ -1066,7 +1066,7 @@ public class Session {
             }
         }
         let reusable = response_reusable(outgoing, response)
-        match IncomingResponse.start(
+        match (try IncomingResponse.start(
             response,
             active,
             self.shared_options.limits,
@@ -1079,7 +1079,7 @@ public class Session {
                 resolved_url:url,
                 redirects:redirects
             )
-        ) {
+        )) {
             success(value) => { return Result<IncomingResponse, HTTP.Error>.success(value) }
             failure(error) => {
                 close_connection(active)
@@ -1102,12 +1102,12 @@ public class Session {
             index--
         }
         if let proxy = self.shared_options.proxy {
-            match validate_proxy_target(url, self.shared_options, deadline) {
+            match (try validate_proxy_target(url, self.shared_options, deadline)) {
                 success => {}
                 failure(error) => { return Result<Connection, HTTP.Error>.failure(error) }
             }
             if url.scheme == "http" {
-                match connect(proxy.url, self.shared_options, deadline) {
+                match (try connect(proxy.url, self.shared_options, deadline)) {
                     success(stream) => {
                         return Result<Connection, HTTP.Error>.success(Connection.plain(stream))
                     }
@@ -1115,7 +1115,7 @@ public class Session {
                 }
             }
             if url.scheme == "https" {
-                match connect_proxy_tls(url, proxy, self.shared_options, deadline) {
+                match (try connect_proxy_tls(url, proxy, self.shared_options, deadline)) {
                     success(stream) => {
                         return Result<Connection, HTTP.Error>.success(Connection.secure(stream))
                     }
@@ -1124,7 +1124,7 @@ public class Session {
             }
         }
         if url.scheme == "http" {
-            match connect(url, self.shared_options, deadline) {
+            match (try connect(url, self.shared_options, deadline)) {
                 success(stream) => {
                     return Result<Connection, HTTP.Error>.success(Connection.plain(stream))
                 }
@@ -1132,7 +1132,7 @@ public class Session {
             }
         }
         if url.scheme == "https" {
-            match connect_tls(url, self.shared_options, deadline) {
+            match (try connect_tls(url, self.shared_options, deadline)) {
                 success(stream) => {
                     return Result<Connection, HTTP.Error>.success(Connection.secure(stream))
                 }
@@ -1487,7 +1487,7 @@ func standard_error(operation:str, detail:str) StandardError {
 }
 
 func close_session(session:Session) {
-    match session.close() { success => {}; failure(error) => {} }
+    match (try session.close()) { success => {}; failure(error) => {} }
 }
 
 func exchange_response(result:Result<Exchange, HTTP.Error>) Result<HTTP.Response, HTTP.Error> {
@@ -1501,16 +1501,16 @@ func exchange_response(result:Result<Exchange, HTTP.Error>) Result<HTTP.Response
 }
 
 public func get(url:str) Result<HTTP.Response, HTTP.Error> {
-    return get(url, default_options())
+    return (try get(url, default_options()))
 }
 
 public func open(url:str) Result<IncomingResponse, HTTP.Error> {
-    return open(url, default_options())
+    return (try open(url, default_options()))
 }
 
 public func open(url:str, options:Options) Result<IncomingResponse, HTTP.Error> {
-    var session = try Session.create(options)
-    var result = session.open(url)
+    var session = try Session.create(options) else error { return Result<IncomingResponse,HTTP.Error>.failure(error) }
+    var result = (try session.open(url))
     close_session(session)
     return result
 }
@@ -1519,7 +1519,7 @@ public func open_request(
     url:str,
     request:HTTP.Request
 ) Result<IncomingResponse, HTTP.Error> {
-    return open_request(url, request, default_options())
+    return (try open_request(url, request, default_options()))
 }
 
 public func open_request(
@@ -1527,35 +1527,35 @@ public func open_request(
     request:HTTP.Request,
     options:Options
 ) Result<IncomingResponse, HTTP.Error> {
-    var session = try Session.create(options)
-    var result = session.open_request(url, request)
+    var session = try Session.create(options) else error { return Result<IncomingResponse,HTTP.Error>.failure(error) }
+    var result = (try session.open_request(url, request))
     close_session(session)
     return result
 }
 
 public func get(url:str, options:Options) Result<HTTP.Response, HTTP.Error> {
-    var session = try Session.create(options)
-    var result = session.get(url)
+    var session = try Session.create(options) else error { return Result<HTTP.Response,HTTP.Error>.failure(error) }
+    var result = (try session.get(url))
     close_session(session)
-    return exchange_response(result)
+    return (try exchange_response(result))
 }
 
-public func head(url:str) Result<HTTP.Response, HTTP.Error> { return head(url, default_options()) }
+public func head(url:str) Result<HTTP.Response, HTTP.Error> { return (try head(url, default_options())) }
 
 public func head(url:str, options:Options) Result<HTTP.Response, HTTP.Error> {
-    var session = try Session.create(options)
-    var result = session.head(url)
+    var session = try Session.create(options) else error { return Result<HTTP.Response,HTTP.Error>.failure(error) }
+    var result = (try session.head(url))
     close_session(session)
-    return exchange_response(result)
+    return (try exchange_response(result))
 }
 
-public func delete(url:str) Result<HTTP.Response, HTTP.Error> { return delete(url, default_options()) }
+public func delete(url:str) Result<HTTP.Response, HTTP.Error> { return (try delete(url, default_options())) }
 
 public func delete(url:str, options:Options) Result<HTTP.Response, HTTP.Error> {
-    var session = try Session.create(options)
-    var result = session.delete(url)
+    var session = try Session.create(options) else error { return Result<HTTP.Response,HTTP.Error>.failure(error) }
+    var result = (try session.delete(url))
     close_session(session)
-    return exchange_response(result)
+    return (try exchange_response(result))
 }
 
 public func post(
@@ -1564,10 +1564,10 @@ public func post(
     options:Options = default_options(),
     content_type:str = "text/plain; charset=utf-8"
 ) Result<HTTP.Response, HTTP.Error> {
-    var session = try Session.create(options)
-    var result = session.post(url, text, content_type)
+    var session = try Session.create(options) else error { return Result<HTTP.Response,HTTP.Error>.failure(error) }
+    var result = (try session.post(url, text, content_type))
     close_session(session)
-    return exchange_response(result)
+    return (try exchange_response(result))
 }
 
 public func put(
@@ -1576,10 +1576,10 @@ public func put(
     options:Options = default_options(),
     content_type:str = "text/plain; charset=utf-8"
 ) Result<HTTP.Response, HTTP.Error> {
-    var session = try Session.create(options)
-    var result = session.put(url, text, content_type)
+    var session = try Session.create(options) else error { return Result<HTTP.Response,HTTP.Error>.failure(error) }
+    var result = (try session.put(url, text, content_type))
     close_session(session)
-    return exchange_response(result)
+    return (try exchange_response(result))
 }
 
 public func patch(
@@ -1588,10 +1588,10 @@ public func patch(
     options:Options = default_options(),
     content_type:str = "text/plain; charset=utf-8"
 ) Result<HTTP.Response, HTTP.Error> {
-    var session = try Session.create(options)
-    var result = session.patch(url, text, content_type)
+    var session = try Session.create(options) else error { return Result<HTTP.Response,HTTP.Error>.failure(error) }
+    var result = (try session.patch(url, text, content_type))
     close_session(session)
-    return exchange_response(result)
+    return (try exchange_response(result))
 }
 
 public func download<W:IO.Writer>(url:str, output:&W) Result<HTTP.Response, HTTP.Error> {
@@ -1628,7 +1628,7 @@ public func send_stream<R:IO.Reader>(
 }
 
 public func send(url:str, request:HTTP.Request) Result<HTTP.Response, HTTP.Error> {
-    return send(url, request, default_options())
+    return (try send(url, request, default_options()))
 }
 
 public func send(
@@ -1636,18 +1636,18 @@ public func send(
     request:HTTP.Request,
     options:Options
 ) Result<HTTP.Response, HTTP.Error> {
-    var session = try Session.create(options)
-    var result = session.send(url, request)
+    var session = try Session.create(options) else error { return Result<HTTP.Response,HTTP.Error>.failure(error) }
+    var result = (try session.send(url, request))
     close_session(session)
-    return exchange_response(result)
+    return (try exchange_response(result))
 }
 
 func close_connection(connection:Connection) {
-    match connection.close() { success => {}; failure(error) => {} }
+    match (try connection.close()) { success => {}; failure(error) => {} }
 }
 
 func close_incoming(incoming:IncomingResponse) {
-    match incoming.close() { success => {}; failure(error) => {} }
+    match (try incoming.close()) { success => {}; failure(error) => {} }
 }
 
 func response_has_body(request:HTTP.Request, response:HTTP.Response) bool {
@@ -1719,7 +1719,7 @@ func validate_proxy_target(
     if options.address_policy == AddressPolicy.unrestricted {
         return Result<void, HTTP.Error>.success()
     }
-    let endpoints = try resolve_endpoints(url, options, deadline)
+    let endpoints = try resolve_endpoints(url, options, deadline) else error { return Result<void,HTTP.Error>.failure(error) }
     if endpoints.is_empty() {
         return Result<void, HTTP.Error>.failure(HTTP.failure(
             HTTP.ErrorKind.network, url.host, "HTTP proxy target resolved to no endpoint"
@@ -1768,23 +1768,23 @@ func connect(
     options:Options,
     deadline:HTTP.DeadlineBudget
 ) Result<TCP.Stream, HTTP.Error> {
-    let endpoints = try resolve_endpoints(url, options, deadline)
+    let endpoints = try resolve_endpoints(url, options, deadline) else error { return Result<TCP.Stream,HTTP.Error>.failure(error) }
     var last:HTTP.Error? = null
     for endpoint in endpoints {
         let connect_timeout = options.connect_timeout_milliseconds
         let read_timeout = try deadline.bounded_timeout(
             options.read_timeout_milliseconds, "HTTP read"
-        )
+        ) else error { return Result<TCP.Stream,HTTP.Error>.failure(error) }
         let write_timeout = try deadline.bounded_timeout(
             options.write_timeout_milliseconds, "HTTP write"
-        )
-        match TCP.connect(endpoint, TCP.ConnectOptions(
+        ) else error { return Result<TCP.Stream,HTTP.Error>.failure(error) }
+        match (try TCP.connect(endpoint, TCP.ConnectOptions(
             connect_timeout_milliseconds:connect_timeout,
             stream:TCP.StreamOptions(
                 read_timeout_milliseconds:read_timeout,
                 write_timeout_milliseconds:write_timeout
             )
-        )) {
+        ))) {
             success(value) => { return Result<TCP.Stream, HTTP.Error>.success(value) }
             failure(error) => {
                 last = HTTP.failure(HTTP.ErrorKind.network, error.subject, error.detail)
@@ -1802,21 +1802,21 @@ func connect_tls(
     options:Options,
     deadline:HTTP.DeadlineBudget
 ) Result<TLS.Stream, HTTP.Error> {
-    let endpoints = try resolve_endpoints(url, options, deadline)
+    let endpoints = try resolve_endpoints(url, options, deadline) else error { return Result<TLS.Stream,HTTP.Error>.failure(error) }
     var last:HTTP.Error? = null
     for endpoint in endpoints {
         let connect_timeout = options.connect_timeout_milliseconds
         let read_timeout = try deadline.bounded_timeout(
             options.read_timeout_milliseconds, "HTTPS read"
-        )
+        ) else error { return Result<TLS.Stream,HTTP.Error>.failure(error) }
         let write_timeout = try deadline.bounded_timeout(
             options.write_timeout_milliseconds, "HTTPS write"
-        )
-        match TLS.connect_endpoint(endpoint, url.host, TLS.ConnectOptions(
+        ) else error { return Result<TLS.Stream,HTTP.Error>.failure(error) }
+        match (try TLS.connect_endpoint(endpoint, url.host, TLS.ConnectOptions(
             connect_timeout_milliseconds:connect_timeout,
             read_timeout_milliseconds:read_timeout,
             write_timeout_milliseconds:write_timeout
-        )) {
+        ))) {
             success(value) => { return Result<TLS.Stream, HTTP.Error>.success(value) }
             failure(error) => {
                 last = HTTP.failure(HTTP.ErrorKind.secure_transport, error.host, error.detail)
@@ -1835,7 +1835,7 @@ func connect_proxy_tls(
     options:Options,
     deadline:HTTP.DeadlineBudget
 ) Result<TLS.Stream, HTTP.Error> {
-    var transport = try connect(proxy.url, options, deadline)
+    var transport = try connect(proxy.url, options, deadline) else error { return Result<TLS.Stream,HTTP.Error>.failure(error) }
     let authority = connect_authority(url)
     var request = HTTP.Request(HTTP.Method.connect, authority)
     request.headers().set("Host", authority)
@@ -1843,7 +1843,7 @@ func connect_proxy_tls(
     if let authorization = proxy.authorization {
         request.headers().set("Proxy-Authorization", authorization)
     }
-    match Codec.write_request<TCP.Stream>(transport, request, deadline) {
+    match (try Codec.write_request<TCP.Stream>(transport, request, deadline)) {
         success => {}
         failure(error) => {
             close_tcp(transport)
@@ -1853,7 +1853,7 @@ func connect_proxy_tls(
         }
     }
     var response = HTTP.Response(500)
-    match Codec.read_final_response_head<TCP.Stream>(transport, options.limits, deadline) {
+    match (try Codec.read_final_response_head<TCP.Stream>(transport, options.limits, deadline)) {
         success(value) => { response = value }
         failure(error) => {
             close_tcp(transport)
@@ -1870,7 +1870,7 @@ func connect_proxy_tls(
             "HTTP proxy rejected CONNECT with status $(response.status())"
         ))
     }
-    match TLS.open(transport, url.host) {
+    match (try TLS.open(transport, url.host)) {
         success(stream) => { return Result<TLS.Stream, HTTP.Error>.success(stream) }
         failure(error) => {
             return Result<TLS.Stream, HTTP.Error>.failure(HTTP.failure(
@@ -1892,7 +1892,7 @@ func connect_authority(url:HTTP.Url) str {
 }
 
 func close_tcp(stream:TCP.Stream) {
-    match TCP.close(move stream) { success => {}; failure(error) => {} }
+    match (try TCP.close(move stream)) { success => {}; failure(error) => {} }
 }
 
 func resolve_endpoints(
@@ -1900,12 +1900,12 @@ func resolve_endpoints(
     options:Options,
     deadline:HTTP.DeadlineBudget
 ) Result<Network.Endpoint[], HTTP.Error> {
-    try deadline.check("HTTP name resolution")
+    try deadline.check("HTTP name resolution") else error { return Result<Network.Endpoint[],HTTP.Error>.failure(error) }
     var resolved:Network.Endpoint[] = []
-    match Network.resolve(url.host, url.port, Network.ResolveOptions(
+    match (try Network.resolve(url.host, url.port, Network.ResolveOptions(
         family:Network.Family.any(),
         transport:Network.Transport.stream()
-    )) {
+    ))) {
         success(value) => { resolved = value }
         failure(error) => {
             return Result<Network.Endpoint[], HTTP.Error>.failure(HTTP.failure(
@@ -1913,7 +1913,7 @@ func resolve_endpoints(
             ))
         }
     }
-    try deadline.check("HTTP name resolution")
+    try deadline.check("HTTP name resolution") else error { return Result<Network.Endpoint[],HTTP.Error>.failure(error) }
     var allowed:Network.Endpoint[] = []
     for endpoint in resolved {
         if endpoint_allowed(endpoint, options.address_policy) { allowed.append(endpoint) }

@@ -168,7 +168,7 @@ public class IncomingBody {
             ))
         }
         var framing = Codec.BodyFraming(kind:0, length:0)
-        match Codec.body_framing(headers) {
+        match (try Codec.body_framing(headers)) {
             success(value) => { framing = value }
             failure(error) => { return Result<IncomingBody, HTTP.Error>.failure(error) }
         }
@@ -213,7 +213,7 @@ public class IncomingBody {
                 var count = self.remaining
                 if count > maximum_bytes { count = maximum_bytes }
                 var bytes:uint8[] = []
-                match Codec.read_count<TCP.Stream>(stream, count, self.deadline_value()) {
+                match (try Codec.read_count<TCP.Stream>(stream, count, self.deadline_value())) {
                     success(value) => { bytes = value }
                     failure(error) => { return Result<uint8[], HTTP.Error>.failure(error) }
                 }
@@ -222,7 +222,7 @@ public class IncomingBody {
                 if self.remaining == 0 { self.complete = true }
                 return Result<uint8[], HTTP.Error>.success(bytes)
             }
-            if self.framing_kind == 2 { return self.read_chunk(stream, maximum_bytes) }
+            if self.framing_kind == 2 { return (try self.read_chunk(stream, maximum_bytes)) }
             self.complete = true
             return Result<uint8[], HTTP.Error>.success([])
         }
@@ -232,7 +232,7 @@ public class IncomingBody {
     }
 
     func read_all() Result<uint8[], HTTP.Error> {
-        return self.read_all(self.maximum_body_bytes)
+        return (try self.read_all(self.maximum_body_bytes))
     }
 
     func read_all(maximum_bytes:int) Result<uint8[], HTTP.Error> {
@@ -245,7 +245,7 @@ public class IncomingBody {
         var result:uint8[] = []
         while !self.complete {
             var bytes:uint8[] = []
-            match self.read() {
+            match (try self.read()) {
                 success(value) => { bytes = value }
                 failure(error) => { return Result<uint8[], HTTP.Error>.failure(error) }
             }
@@ -260,7 +260,7 @@ public class IncomingBody {
 
     func discard() Result<void, HTTP.Error> {
         while !self.complete {
-            match self.read() {
+            match (try self.read()) {
                 success(bytes) => {}
                 failure(error) => { return Result<void, HTTP.Error>.failure(error) }
             }
@@ -272,7 +272,7 @@ public class IncomingBody {
         let violated = self.body_limit_exceeded
         self.maximum_body_bytes = self.limits.maximum_body_bytes
         self.body_limit_exceeded = false
-        var result = self.discard()
+        var result = (try self.discard())
         self.body_limit_exceeded = violated
         return result
     }
@@ -282,7 +282,7 @@ public class IncomingBody {
         while self.chunk_remaining == 0 {
             var line = ""
             var budget = self.metadata_budget
-            match Codec.read_line<TCP.Stream>(connection, budget, "HTTP chunk size", self.deadline_value()) {
+            match (try Codec.read_line<TCP.Stream>(connection, budget, "HTTP chunk size", self.deadline_value())) {
                 success(value) => { line = value; self.metadata_budget = budget }
                 failure(error) => { return Result<uint8[], HTTP.Error>.failure(error) }
             }
@@ -293,7 +293,7 @@ public class IncomingBody {
                 ))
             }
             if size == 0 {
-                match self.read_trailers(connection) {
+                match (try self.read_trailers(connection)) {
                     success => {}
                     failure(error) => { return Result<uint8[], HTTP.Error>.failure(error) }
                 }
@@ -309,7 +309,7 @@ public class IncomingBody {
         var count = self.chunk_remaining
         if count > maximum_bytes { count = maximum_bytes }
         var bytes:uint8[] = []
-        match Codec.read_count<TCP.Stream>(connection, count, self.deadline_value()) {
+        match (try Codec.read_count<TCP.Stream>(connection, count, self.deadline_value())) {
             success(value) => { bytes = value }
             failure(error) => { return Result<uint8[], HTTP.Error>.failure(error) }
         }
@@ -317,7 +317,7 @@ public class IncomingBody {
         self.total += bytes.count()
         if self.chunk_remaining == 0 {
             var ending:uint8[] = []
-            match Codec.read_count<TCP.Stream>(connection, 2, self.deadline_value()) {
+            match (try Codec.read_count<TCP.Stream>(connection, 2, self.deadline_value())) {
                 success(value) => { ending = value }
                 failure(error) => { return Result<uint8[], HTTP.Error>.failure(error) }
             }
@@ -336,7 +336,7 @@ public class IncomingBody {
         while true {
             var line = ""
             var budget = self.metadata_budget
-            match Codec.read_line<TCP.Stream>(connection, budget, "HTTP trailer", self.deadline_value()) {
+            match (try Codec.read_line<TCP.Stream>(connection, budget, "HTTP trailer", self.deadline_value())) {
                 success(value) => { line = value; self.metadata_budget = budget }
                 failure(error) => { return Result<void, HTTP.Error>.failure(error) }
             }
@@ -348,7 +348,7 @@ public class IncomingBody {
                 ))
             }
             var header = HTTP.Header(name:"", value:"")
-            match Codec.parse_header_line(line) {
+            match (try Codec.parse_header_line(line)) {
                 success(value) => { header = value }
                 failure(error) => { return Result<void, HTTP.Error>.failure(error) }
             }
@@ -395,17 +395,17 @@ public class ResponseWriter {
     package func reusable() bool { return self.complete && self.persistent }
 
     func send(response:@HTTP.Response) Result<void, HTTP.Error> {
-        if self.complete { return self.already_finished() }
+        if self.complete { return (try self.already_finished()) }
         self.configure_connection(response)
         if var stream = self.connection {
-            match Codec.write_response<TCP.Stream>(
+            match (try Codec.write_response<TCP.Stream>(
                 stream, response, self.include_body, self.deadline_value()
-            ) {
+            )) {
                 success => { self.complete = true; return Result<void, HTTP.Error>.success() }
                 failure(error) => { return Result<void, HTTP.Error>.failure(error) }
             }
         }
-        return self.closed()
+        return (try self.closed())
     }
 
     func stream<R:IO.Reader>(
@@ -413,10 +413,10 @@ public class ResponseWriter {
         input:&R,
         content_length:int
     ) Result<void, HTTP.Error> {
-        if self.complete { return self.already_finished() }
+        if self.complete { return (try self.already_finished()) }
         self.configure_connection(response)
         if var stream = self.connection {
-            match Codec.write_response_from<TCP.Stream, R>(
+            match (try Codec.write_response_from<TCP.Stream, R>(
                 stream,
                 response,
                 input,
@@ -424,34 +424,34 @@ public class ResponseWriter {
                 self.maximum_body_bytes,
                 self.include_body,
                 self.deadline_value()
-            ) {
+            )) {
                 success => { self.complete = true; return Result<void, HTTP.Error>.success() }
                 failure(error) => { return Result<void, HTTP.Error>.failure(error) }
             }
         }
-        return self.closed()
+        return (try self.closed())
     }
 
     func stream_chunked<R:IO.Reader>(
         response:@HTTP.Response,
         input:&R
     ) Result<void, HTTP.Error> {
-        if self.complete { return self.already_finished() }
+        if self.complete { return (try self.already_finished()) }
         self.configure_connection(response)
         if var stream = self.connection {
-            match Codec.write_response_chunked<TCP.Stream, R>(
+            match (try Codec.write_response_chunked<TCP.Stream, R>(
                 stream,
                 response,
                 input,
                 self.maximum_body_bytes,
                 self.include_body,
                 self.deadline_value()
-            ) {
+            )) {
                 success => { self.complete = true; return Result<void, HTTP.Error>.success() }
                 failure(error) => { return Result<void, HTTP.Error>.failure(error) }
             }
         }
-        return self.closed()
+        return (try self.closed())
     }
 
     private func deadline_value() HTTP.DeadlineBudget {
@@ -489,7 +489,7 @@ public class Listener {
 
     func local_endpoint() Result<Network.Endpoint, HTTP.Error> {
         if var socket = self.socket {
-            match TCP.local_endpoint(socket) {
+            match (try TCP.local_endpoint(socket)) {
                 success(endpoint) => { return Result<Network.Endpoint, HTTP.Error>.success(endpoint) }
                 failure(error) => {
                     return Result<Network.Endpoint, HTTP.Error>.failure(HTTP.failure(
@@ -509,8 +509,8 @@ public class Listener {
 
     func serve_once(handler:func(@HTTP.Request) HTTP.Response) Result<void, HTTP.Error> {
         if var socket = self.socket {
-            var accepted = try accept(socket, self.options)
-            var result = serve_connection(accepted.stream, accepted.peer, self.options, handler, false)
+            var accepted = try accept(socket, self.options) else error { return Result<void,HTTP.Error>.failure(error) }
+            var result = (try serve_connection(accepted.stream, accepted.peer, self.options, handler, false))
             close_stream(accepted.stream)
             return result
         }
@@ -522,7 +522,7 @@ public class Listener {
     }
 
     func serve(handler:func(@HTTP.Request) HTTP.Response) Result<void, HTTP.Error> {
-        return self.serve_while(handler, func() bool { return true })
+        return (try self.serve_while(handler, func() bool { return true }))
     }
 
     func serve_while(
@@ -531,8 +531,8 @@ public class Listener {
     ) Result<void, HTTP.Error> {
         while continue_serving() {
             if var socket = self.socket {
-                var accepted = try accept(socket, self.options)
-                var result = serve_connection(accepted.stream, accepted.peer, self.options, handler, true)
+                var accepted = try accept(socket, self.options) else error { return Result<void,HTTP.Error>.failure(error) }
+                var result = (try serve_connection(accepted.stream, accepted.peer, self.options, handler, true))
                 close_stream(accepted.stream)
                 match result {
                     success => {}
@@ -553,8 +553,8 @@ public class Listener {
         handler:func(@HTTP.Request, IncomingBody) HTTP.Response
     ) Result<void, HTTP.Error> {
         if var socket = self.socket {
-            var accepted = try accept(socket, self.options)
-            var result = serve_stream_connection(accepted.stream, accepted.peer, self.options, handler, false)
+            var accepted = try accept(socket, self.options) else error { return Result<void,HTTP.Error>.failure(error) }
+            var result = (try serve_stream_connection(accepted.stream, accepted.peer, self.options, handler, false))
             close_stream(accepted.stream)
             return result
         }
@@ -566,7 +566,7 @@ public class Listener {
     func serve_stream(
         handler:func(@HTTP.Request, IncomingBody) HTTP.Response
     ) Result<void, HTTP.Error> {
-        return self.serve_stream_while(handler, func() bool { return true })
+        return (try self.serve_stream_while(handler, func() bool { return true }))
     }
 
     func serve_stream_while(
@@ -574,12 +574,12 @@ public class Listener {
         continue_serving:func() bool
     ) Result<void, HTTP.Error> {
         if self.options.worker_count > 1 {
-            return self.serve_stream_workers_while(handler, continue_serving)
+            return (try self.serve_stream_workers_while(handler, continue_serving))
         }
         while continue_serving() {
             if var socket = self.socket {
-                var accepted = try accept(socket, self.options)
-                var result = serve_stream_connection(accepted.stream, accepted.peer, self.options, handler, true)
+                var accepted = try accept(socket, self.options) else error { return Result<void,HTTP.Error>.failure(error) }
+                var result = (try serve_stream_connection(accepted.stream, accepted.peer, self.options, handler, true))
                 close_stream(accepted.stream)
                 match result {
                     success => {}
@@ -611,7 +611,7 @@ public class Listener {
                 continue
             }
             if var socket = self.socket {
-                var accepted = try accept(socket, self.options)
+                var accepted = try accept(socket, self.options) else error { return Result<void,HTTP.Error>.failure(error) }
                 pending.append(executor.submit(StreamConnectionJob(
                     connection:accepted.stream,
                     peer:accepted.peer,
@@ -636,8 +636,8 @@ public class Listener {
         handler:func(@HTTP.Request, IncomingBody, ResponseWriter) Result<void, HTTP.Error>
     ) Result<void, HTTP.Error> {
         if var socket = self.socket {
-            var accepted = try accept(socket, self.options)
-            var result = serve_writer_connection(accepted.stream, accepted.peer, self.options, handler, false)
+            var accepted = try accept(socket, self.options) else error { return Result<void,HTTP.Error>.failure(error) }
+            var result = (try serve_writer_connection(accepted.stream, accepted.peer, self.options, handler, false))
             close_stream(accepted.stream)
             return result
         }
@@ -649,7 +649,7 @@ public class Listener {
     func serve_stream(
         handler:func(@HTTP.Request, IncomingBody, ResponseWriter) Result<void, HTTP.Error>
     ) Result<void, HTTP.Error> {
-        return self.serve_stream_while(handler, func() bool { return true })
+        return (try self.serve_stream_while(handler, func() bool { return true }))
     }
 
     func serve_stream_while(
@@ -658,8 +658,8 @@ public class Listener {
     ) Result<void, HTTP.Error> {
         while continue_serving() {
             if var socket = self.socket {
-                var accepted = try accept(socket, self.options)
-                var result = serve_writer_connection(accepted.stream, accepted.peer, self.options, handler, true)
+                var accepted = try accept(socket, self.options) else error { return Result<void,HTTP.Error>.failure(error) }
+                var result = (try serve_writer_connection(accepted.stream, accepted.peer, self.options, handler, true))
                 close_stream(accepted.stream)
                 match result {
                     success => {}
@@ -679,7 +679,7 @@ public class Listener {
     func close() Result<void, HTTP.Error> {
         if var socket = self.socket {
             self.socket = null
-            match TCP.close(move socket) {
+            match (try TCP.close(move socket)) {
                 success => { return Result<void, HTTP.Error>.success() }
                 failure(error) => {
                     return Result<void, HTTP.Error>.failure(HTTP.failure(
@@ -700,19 +700,19 @@ public class Listener {
     drop {
         if var socket = self.socket {
             self.socket = null
-            match TCP.close(move socket) { success => {}; failure(error) => {} }
+            match (try TCP.close(move socket)) { success => {}; failure(error) => {} }
         }
     }
 }
 
 public func listen(host:str, port:uint16) Result<Listener, HTTP.Error> {
-    return listen(host, port, default_options())
+    return (try listen(host, port, default_options()))
 }
 
 public func listen(host:str, port:uint16, options:Options) Result<Listener, HTTP.Error> {
-    try validate_options(options)
+    try validate_options(options) else error { return Result<Listener,HTTP.Error>.failure(error) }
     var address = Network.IpAddress.ipv4([0, 0, 0, 0])
-    match Network.parse_ip(host) {
+    match (try Network.parse_ip(host)) {
         success(value) => { address = value }
         failure(error) => {
             return Result<Listener, HTTP.Error>.failure(HTTP.failure(
@@ -723,7 +723,7 @@ public func listen(host:str, port:uint16, options:Options) Result<Listener, HTTP
         }
     }
     let endpoint = Network.Endpoint(address:address, port:port, scope_id:0)
-    match TCP.listen(endpoint, options.backlog) {
+    match (try TCP.listen(endpoint, options.backlog)) {
         success(socket) => { return Result<Listener, HTTP.Error>.success(Listener(socket, options)) }
         failure(error) => {
             return Result<Listener, HTTP.Error>.failure(HTTP.failure(
@@ -745,7 +745,7 @@ struct StreamConnectionJob:Threading.Job {
     func execute() {
         if var stream = self.connection {
             self.connection = null
-            match serve_stream_connection(stream, self.peer, self.options, self.handler, true) {
+            match (try serve_stream_connection(stream, self.peer, self.options, self.handler, true)) {
                 success => {}
                 failure(error) => {
                     if !connection_error(error) { self.execution_error = error }
@@ -770,35 +770,35 @@ func serve_connection(
     var served = 0
     while true {
         var request = HTTP.Request.get("/")
-        match Codec.read_request_head<TCP.Stream>(connection, options.limits, deadline) {
+        match (try Codec.read_request_head<TCP.Stream>(connection, options.limits, deadline)) {
             success(value) => { request = value }
             failure(error) => {
                 if served > 0 && error.kind == HTTP.ErrorKind.closed {
                     return Result<void, HTTP.Error>.success()
                 }
-                return fail_connection(connection, error, deadline)
+                return (try fail_connection(connection, error, deadline))
             }
         }
         request.set_peer(peer)
-        var incoming = IncomingBody.open(connection, request.headers(), options.limits, deadline)
+        var incoming = (try IncomingBody.open(connection, request.headers(), options.limits, deadline))
         var body:IncomingBody? = null
         match incoming {
             success(value) => { body = value }
-            failure(error) => { return fail_connection(connection, error, deadline) }
+            failure(error) => { return (try fail_connection(connection, error, deadline)) }
         }
         if var source = body {
-            match source.read_all() {
+            match (try source.read_all()) {
                 success(bytes) => { request.set_body(bytes) }
-                failure(error) => { return fail_connection(connection, error, deadline) }
+                failure(error) => { return (try fail_connection(connection, error, deadline)) }
             }
         }
         var response = handler(request)
         let keep = persistent && request_keeps_connection(request.headers()) &&
             !response_closes_connection(response.headers())
         set_response_connection(response, keep)
-        match Codec.write_response<TCP.Stream>(
+        match (try Codec.write_response<TCP.Stream>(
             connection, response, request.method() != HTTP.Method.head, deadline
-        ) {
+        )) {
             success => {}
             failure(error) => { return Result<void, HTTP.Error>.failure(error) }
         }
@@ -820,19 +820,19 @@ func serve_stream_connection(
     var served = 0
     while true {
         var request = HTTP.Request.get("/")
-        match Codec.read_request_head<TCP.Stream>(connection, options.limits, deadline) {
+        match (try Codec.read_request_head<TCP.Stream>(connection, options.limits, deadline)) {
             success(value) => { request = value }
             failure(error) => {
                 if served > 0 && error.kind == HTTP.ErrorKind.closed {
                     return Result<void, HTTP.Error>.success()
                 }
-                return fail_connection(connection, error, deadline)
+                return (try fail_connection(connection, error, deadline))
             }
         }
         request.set_peer(peer)
         var body:IncomingBody? = null
-        match IncomingBody.open(connection, request.headers(), options.limits, deadline) {
-            failure(error) => { return fail_connection(connection, error, deadline) }
+        match (try IncomingBody.open(connection, request.headers(), options.limits, deadline)) {
+            failure(error) => { return (try fail_connection(connection, error, deadline)) }
             success(value) => { body = value }
         }
         if var incoming = body {
@@ -840,22 +840,22 @@ func serve_stream_connection(
             let route_limit_exceeded = incoming.exceeded_limit()
             var discarded = Result<void, HTTP.Error>.success()
             if route_limit_exceeded {
-                discarded = incoming.discard_transport()
-            } else { discarded = incoming.discard() }
+                discarded = (try incoming.discard_transport())
+            } else { discarded = (try incoming.discard()) }
             match discarded {
                 success => {}
                 failure(error) => {
                     if error.kind == HTTP.ErrorKind.body_limit {
                         response = HTTP.Response.text(413, error.detail)
-                    } else { return fail_connection(connection, error, deadline) }
+                    } else { return (try fail_connection(connection, error, deadline)) }
                 }
             }
             let keep = persistent && request_keeps_connection(request.headers()) &&
                 !response_closes_connection(response.headers()) && !route_limit_exceeded
             set_response_connection(response, keep)
-            match Codec.write_response<TCP.Stream>(
+            match (try Codec.write_response<TCP.Stream>(
                 connection, response, request.method() != HTTP.Method.head, deadline
-            ) {
+            )) {
                 success => {}
                 failure(error) => { return Result<void, HTTP.Error>.failure(error) }
             }
@@ -878,20 +878,20 @@ func serve_writer_connection(
     var served = 0
     while true {
         var request = HTTP.Request.get("/")
-        match Codec.read_request_head<TCP.Stream>(connection, options.limits, deadline) {
+        match (try Codec.read_request_head<TCP.Stream>(connection, options.limits, deadline)) {
             success(value) => { request = value }
             failure(error) => {
                 if served > 0 && error.kind == HTTP.ErrorKind.closed {
                     return Result<void, HTTP.Error>.success()
                 }
-                return fail_connection(connection, error, deadline)
+                return (try fail_connection(connection, error, deadline))
             }
         }
         request.set_peer(peer)
         var body:IncomingBody? = null
-        match IncomingBody.open(connection, request.headers(), options.limits, deadline) {
+        match (try IncomingBody.open(connection, request.headers(), options.limits, deadline)) {
             success(value) => { body = value }
-            failure(error) => { return fail_connection(connection, error, deadline) }
+            failure(error) => { return (try fail_connection(connection, error, deadline)) }
         }
         if var incoming = body {
             let keep = persistent && request_keeps_connection(request.headers())
@@ -902,22 +902,22 @@ func serve_writer_connection(
                 deadline,
                 keep
             )
-            match handler(request, incoming, writer) {
+            match (try handler(request, incoming, writer)) {
                 failure(error) => {
                     if writer.finished() { return Result<void, HTTP.Error>.failure(error) }
-                    return fail_connection(connection, error, deadline)
+                    return (try fail_connection(connection, error, deadline))
                 }
                 success => {
                     if !writer.finished() {
-                        return fail_connection(connection, HTTP.failure(
+                        return (try fail_connection(connection, HTTP.failure(
                             HTTP.ErrorKind.invalid_response,
                             null,
                             "HTTP streaming handler returned without sending a response"
-                        ), deadline)
+                        ), deadline))
                     }
                 }
             }
-            match incoming.discard() {
+            match (try incoming.discard()) {
                 success => {}
                 failure(error) => { return Result<void, HTTP.Error>.failure(error) }
             }
@@ -937,7 +937,7 @@ func fail_connection(
     let status = protocol_status(error.kind)
     if status > 0 {
         var response = HTTP.Response.text(status, error.detail)
-        match Codec.write_response<TCP.Stream>(connection, response, true, deadline) {
+        match (try Codec.write_response<TCP.Stream>(connection, response, true, deadline)) {
             success => {}
             failure(write_error) => { return Result<void, HTTP.Error>.failure(write_error) }
         }
@@ -1039,7 +1039,7 @@ func bounded_stream_timeout(configured:int?, total:int?) int? {
 }
 
 func accept(socket:&TCP.Listener, options:Options) Result<TCP.Accepted, HTTP.Error> {
-    match TCP.accept(
+    match (try TCP.accept(
         socket,
         options.accept_timeout_milliseconds,
         TCP.StreamOptions(
@@ -1050,7 +1050,7 @@ func accept(socket:&TCP.Listener, options:Options) Result<TCP.Accepted, HTTP.Err
                 options.write_timeout_milliseconds, options.connection_timeout_milliseconds
             )
         )
-    ) {
+    )) {
         success(value) => { return Result<TCP.Accepted, HTTP.Error>.success(value) }
         failure(error) => {
             return Result<TCP.Accepted, HTTP.Error>.failure(HTTP.failure(
@@ -1063,5 +1063,5 @@ func accept(socket:&TCP.Listener, options:Options) Result<TCP.Accepted, HTTP.Err
 }
 
 func close_stream(stream:TCP.Stream) {
-    match TCP.close(move stream) { success => {}; failure(error) => {} }
+    match (try TCP.close(move stream)) { success => {}; failure(error) => {} }
 }

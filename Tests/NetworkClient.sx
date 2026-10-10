@@ -13,10 +13,10 @@ func raw_ambiguous_request(port:uint16) {
         scope_id:0
     )
     var stream:TCP.Stream? = null
-    match TCP.connect(endpoint, TCP.ConnectOptions(
+    match (try TCP.connect(endpoint, TCP.ConnectOptions(
         connect_timeout_milliseconds:null,
         stream:TCP.StreamOptions(read_timeout_milliseconds:2_000, write_timeout_milliseconds:2_000)
-    )) {
+    ))) {
         success(value) => { stream = value }
         failure(error) => { panic(error.detail) }
     }
@@ -27,29 +27,29 @@ func raw_ambiguous_request(port:uint16) {
         "Transfer-Encoding: chunked\r\n\r\n"
     )
     if var connection = stream {
-        match IO.write_all<TCP.Stream>(connection, @request[0:request.count()]) {
+        match (try IO.write_all<TCP.Stream>(connection, @request[0:request.count()])) {
             success => {}
             failure(error) => { panic(error.detail) }
         }
-        match connection.shutdown_write() {
+        match (try connection.shutdown_write()) {
             success => {}
             failure(error) => { panic(error.detail) }
         }
         var response:uint8[] = []
-        match IO.read_to_end<TCP.Stream>(connection, 65_536) {
+        match (try IO.read_to_end<TCP.Stream>(connection, 65_536)) {
             success(value) => { response = value }
             failure(error) => { panic(error.detail) }
         }
         assert(response.count() >= 12)
         assert(response[9] == 52 && response[10] == 48 && response[11] == 48)
-        match TCP.close(move connection) { success => {}; failure(error) => {} }
+        match (try TCP.close(move connection)) { success => {}; failure(error) => {} }
     } else { panic("raw HTTP connection should be available") }
 }
 
 func run(port:uint16) Result<void, HTTP.Error> {
     let origin = "http://127.0.0.1:$(port)"
 
-    match Client.get(origin + "/known", Client.default_options().with_public_network_only()) {
+    match (try Client.get(origin + "/known", Client.default_options().with_public_network_only())) {
         success(response) => { panic("public-only policy should reject loopback") }
         failure(error) => { assert(error.kind == HTTP.ErrorKind.network_policy) }
     }
@@ -57,72 +57,72 @@ func run(port:uint16) Result<void, HTTP.Error> {
 
     var session = try Client.Session.create(
         Client.default_options().with_maximum_idle_connections_per_origin(2)
-    )
-    try session.set_default_header("X-Session", "shared")
-    try session.authenticate_basic("user", "pass")
+    ) else error { return Result<void,HTTP.Error>.failure(error) }
+    try session.set_default_header("X-Session", "shared") else error { return Result<void,HTTP.Error>.failure(error) }
+    try session.authenticate_basic("user", "pass") else error { return Result<void,HTTP.Error>.failure(error) }
     session.enable_cookies()
-    var login = try session.get(origin + "/session/login")
-    let peer = try login.response.text()
+    var login = try session.get(origin + "/session/login") else error { return Result<void,HTTP.Error>.failure(error) }
+    let peer = try login.response.text() else error { return Result<void,HTTP.Error>.failure(error) }
     assert(login.final_url.text() == origin + "/session/login")
     assert(login.redirects.count() == 0)
     assert(session.idle_connection_count() == 1)
 
-    var basic = try session.get(origin + "/session/check")
-    assert(try basic.response.text() == peer + "|shared|Basic dXNlcjpwYXNz|sid=silex")
+    var basic = try session.get(origin + "/session/check") else error { return Result<void,HTTP.Error>.failure(error) }
+    assert(try basic.response.text() else error { return Result<void,HTTP.Error>.failure(error) } == peer + "|shared|Basic dXNlcjpwYXNz|sid=silex")
     assert(session.idle_connection_count() == 1)
 
-    try session.authenticate_bearer("token")
-    var bearer = try session.get(origin + "/session/check")
-    assert(try bearer.response.text() == peer + "|shared|Bearer token|sid=silex")
+    try session.authenticate_bearer("token") else error { return Result<void,HTTP.Error>.failure(error) }
+    var bearer = try session.get(origin + "/session/check") else error { return Result<void,HTTP.Error>.failure(error) }
+    assert(try bearer.response.text() else error { return Result<void,HTTP.Error>.failure(error) } == peer + "|shared|Bearer token|sid=silex")
 
-    var history = try session.get(origin + "/redirect")
+    var history = try session.get(origin + "/redirect") else error { return Result<void,HTTP.Error>.failure(error) }
     assert(history.final_url.text() == origin + "/chunked")
     assert(history.redirects.count() == 1)
     assert(history.redirects[0].url.text() == origin + "/redirect")
     assert(history.redirects[0].next_url.text() == origin + "/chunked")
-    assert(try history.response.text() == "chunked stream")
+    assert(try history.response.text() else error { return Result<void,HTTP.Error>.failure(error) } == "chunked stream")
     assert(session.idle_connection_count() == 1)
-    try session.close()
+    try session.close() else error { return Result<void,HTTP.Error>.failure(error) }
     assert(session.is_closed())
     print("ok - reusable session, keep-alive, auth, cookies and redirect history")
 
     var slow = try Client.open(
         origin + "/slow",
         Client.default_options().with_total_timeout(20)
-    )
-    match slow.read_all() {
+    ) else error { return Result<void,HTTP.Error>.failure(error) }
+    match (try slow.read_all()) {
         success(bytes) => { panic("slow response should exceed the total deadline") }
         failure(error) => { assert(error.kind == HTTP.ErrorKind.deadline_exceeded) }
     }
-    match slow.close() { success => {}; failure(error) => {} }
+    match (try slow.close()) { success => {}; failure(error) => {} }
     print("ok - slow response deadline")
 
-    var cutoff = try Client.open(origin + "/cutoff")
-    match cutoff.read_all() {
+    var cutoff = try Client.open(origin + "/cutoff") else error { return Result<void,HTTP.Error>.failure(error) }
+    match (try cutoff.read_all()) {
         success(bytes) => { panic("premature response cutoff should fail") }
         failure(error) => { assert(error.kind == HTTP.ErrorKind.closed) }
     }
-    match cutoff.close() { success => {}; failure(error) => {} }
+    match (try cutoff.close()) { success => {}; failure(error) => {} }
     print("ok - premature cutoff")
 
-    var redirected = try Client.open(origin + "/redirect")
+    var redirected = try Client.open(origin + "/redirect") else error { return Result<void,HTTP.Error>.failure(error) }
     assert(redirected.status() == 200)
-    let redirected_body = try redirected.read_all()
+    let redirected_body = try redirected.read_all() else error { return Result<void,HTTP.Error>.failure(error) }
     assert(redirected_body.count() == 14)
-    try redirected.close()
+    try redirected.close() else error { return Result<void,HTTP.Error>.failure(error) }
     print("ok - streaming redirect")
 
     raw_ambiguous_request(port)
     print("ok - ambiguous framing")
 
-    var healthy = try Client.get(origin + "/known")
-    assert(try healthy.text() == "known stream")
+    var healthy = try Client.get(origin + "/known") else error { return Result<void,HTTP.Error>.failure(error) }
+    assert(try healthy.text() else error { return Result<void,HTTP.Error>.failure(error) } == "known stream")
     print("deadlines, cutoffs, ambiguity rejection and server recovery verified")
     return Result<void, HTTP.Error>.success()
 }
 
 func selected_port() uint16 {
-    match Process.arguments() {
+    match (try Process.arguments()) {
         success(arguments) => {
             if arguments.count() > 1 { return parse_port(arguments[1]) }
         }
@@ -143,7 +143,7 @@ func parse_port(text:str) uint16 {
 }
 
 func main() {
-    match run(selected_port()) {
+    match (try run(selected_port())) {
         success => {}
         failure(error) => { panic(error.detail) }
     }

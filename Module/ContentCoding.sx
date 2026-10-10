@@ -22,10 +22,10 @@ public func decompress(
         ))
     }
     if encoding == "gzip" || encoding == "x-gzip" {
-        return decompress_format(body, Compression.Format.gzip, maximum_output_bytes, encoding)
+        return (try decompress_format(body, Compression.Format.gzip, maximum_output_bytes, encoding))
     }
     if encoding == "deflate" {
-        match Compression.decompress(body, Compression.Format.zlib, maximum_output_bytes) {
+        match (try Compression.decompress(body, Compression.Format.zlib, maximum_output_bytes)) {
             success(value) => { return Result<uint8[], HTTP.Error>.success(value) }
             failure(error) => {
                 if error.kind == StandardError.Kind.limit_exceeded {
@@ -33,7 +33,7 @@ public func decompress(
                 }
             }
         }
-        return decompress_format(body, Compression.Format.raw_deflate, maximum_output_bytes, encoding)
+        return (try decompress_format(body, Compression.Format.raw_deflate, maximum_output_bytes, encoding))
     }
     return Result<uint8[], HTTP.Error>.failure(HTTP.failure(
         HTTP.ErrorKind.unsupported_transfer,
@@ -49,11 +49,11 @@ public func decompress_response(
     if let encoding = response.headers().get("Content-Encoding") {
         let encoded = response.body()
         var decoded:uint8[] = []
-        match decompress(
+        match (try decompress(
             @encoded[0:encoded.count()],
             encoding,
             maximum_output_bytes
-        ) {
+        )) {
             success(value) => { decoded = value }
             failure(error) => { return Result<void, HTTP.Error>.failure(error) }
         }
@@ -72,7 +72,7 @@ func decompress_format(
     maximum_output_bytes:int,
     encoding:str
 ) Result<uint8[], HTTP.Error> {
-    match Compression.decompress(body, format, maximum_output_bytes) {
+    match (try Compression.decompress(body, format, maximum_output_bytes)) {
         success(value) => { return Result<uint8[], HTTP.Error>.success(value) }
         failure(error) => {
             return Result<uint8[], HTTP.Error>.failure(compression_failure(error, encoding))

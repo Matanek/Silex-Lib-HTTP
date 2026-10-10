@@ -11,9 +11,9 @@ autre package.
 use HTTP.Client
 use JSON
 
-var response = try Client.get("https://example.com/api?limit=10")
-try response.require_success()
-let data = JSON.parse(try response.text())
+var response = Client.get("https://example.com/api?limit=10")
+response.require_success()
+var data = JSON.parse(response.text())
 ```
 
 Les opérations `get`, `head`, `delete`, `post`, `put` et `patch` couvrent les
@@ -30,18 +30,18 @@ d’origine et refuse une rétrogradation HTTPS vers HTTP.
 Une `Client.Session` possède sa configuration et son pool de connexions.
 
 ```sx
-var session = try Client.Session.create(
+var session = Client.Session.create(
     Client.default_options().with_maximum_idle_connections_per_origin(4)
 )
-try session.set_default_header("Accept", "application/json")
-try session.authenticate_bearer(token)
+session.set_default_header("Accept", "application/json")
+session.authenticate_bearer(token)
 session.enable_cookies()
 
-var exchange = try session.get("https://example.com/api")
+var exchange = session.get("https://example.com/api")
 print(exchange.final_url.text())
 print(exchange.redirects.count())
 
-try session.close()
+session.close()
 ```
 
 Les en-têtes propres à une requête priment sur les valeurs par défaut. Les
@@ -98,8 +98,8 @@ func handle(request:@HTTP.Request) HTTP.Response {
     return HTTP.Response.text(404, "Not found")
 }
 
-var server = try Server.listen("127.0.0.1", 8080)
-try server.serve(handle)
+var server = Server.listen("127.0.0.1", 8080)
+server.serve(handle)
 ```
 
 `HTTP.Server.Router` associe méthodes et chemins. `:name` capture un segment et

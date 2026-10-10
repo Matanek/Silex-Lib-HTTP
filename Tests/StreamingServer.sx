@@ -53,45 +53,45 @@ func handle(
     body:Server.IncomingBody,
     response:Server.ResponseWriter
 ) Result<void, HTTP.Error> {
-    try body.discard()
+    try body.discard() else error { return Result<void,HTTP.Error>.failure(error) }
     if request.path() == "/session/login" {
         var login = HTTP.Response.text(200, peer_text(request))
         login.headers().append("Set-Cookie", "sid=silex; Path=/session; HttpOnly")
-        return response.send(login)
+        return (try response.send(login))
     }
     if request.path() == "/session/check" {
         let value = peer_text(request) + "|" + header(request, "X-Session") + "|" +
             header(request, "Authorization") + "|" + header(request, "Cookie")
-        return response.send(HTTP.Response.text(200, value))
+        return (try response.send(HTTP.Response.text(200, value)))
     }
     if request.path() == "/redirect" {
         var redirect = HTTP.Response(302, "Found")
         redirect.headers().set("Location", "/chunked")
-        return response.send(redirect)
+        return (try response.send(redirect))
     }
     if request.path() == "/known" {
         var source = TextReader("known stream")
         var head = HTTP.Response(200, "OK")
         head.headers().set("Content-Type", "text/plain; charset=utf-8")
-        return response.stream<TextReader>(head, source, 12)
+        return (try response.stream<TextReader>(head, source, 12))
     }
     if request.path() == "/chunked" {
         var source = TextReader("chunked stream")
         var head = HTTP.Response(200, "OK")
         head.headers().set("Content-Type", "text/plain; charset=utf-8")
-        return response.stream_chunked<TextReader>(head, source)
+        return (try response.stream_chunked<TextReader>(head, source))
     }
     if request.path() == "/cutoff" {
         var source = TextReader("cut")
         var head = HTTP.Response(200, "OK")
-        return response.stream<TextReader>(head, source, 8)
+        return (try response.stream<TextReader>(head, source, 8))
     }
     if request.path() == "/slow" {
         var source = SlowReader()
         var head = HTTP.Response(200, "OK")
-        return response.stream_chunked<SlowReader>(head, source)
+        return (try response.stream_chunked<SlowReader>(head, source))
     }
-    return response.send(HTTP.Response.text(404, "Not found"))
+    return (try response.send(HTTP.Response.text(404, "Not found")))
 }
 
 func peer_text(request:@HTTP.Request) str {
@@ -109,14 +109,14 @@ func run(port:uint16) Result<void, HTTP.Error> {
         "127.0.0.1",
         port,
         Server.default_options().with_connection_timeout(5_000)
-    )
-    let endpoint = try server.local_endpoint()
+    ) else error { return Result<void,HTTP.Error>.failure(error) }
+    let endpoint = try server.local_endpoint() else error { return Result<void,HTTP.Error>.failure(error) }
     print("Listening on http://$(Network.format_endpoint(endpoint))")
-    return server.serve_stream(handle)
+    return (try server.serve_stream(handle))
 }
 
 func selected_port() uint16 {
-    match Process.arguments() {
+    match (try Process.arguments()) {
         success(arguments) => {
             if arguments.count() > 1 { return parse_port(arguments[1]) }
         }
@@ -137,7 +137,7 @@ func parse_port(text:str) uint16 {
 }
 
 func main() {
-    match run(selected_port()) {
+    match (try run(selected_port())) {
         success => {}
         failure(error) => { panic(error.detail) }
     }
