@@ -1,6 +1,6 @@
 # Historique
 
-## [0.7.0] - 2026-11-08
+## [0.7.0] - 2026-11-09
 
 - Adopte la déclaration `Result` unique : l’appel ordinaire rend la valeur
   ou arrête le programme sur erreur ; `try appel()` conserve le `Result`. Les
